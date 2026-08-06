@@ -192,14 +192,16 @@ async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> 
   try {
     const owner = JSON.parse(await fs.readFile(path.join(lockPath, "owner.json"), "utf8")) as {
       pid?: unknown;
-      createdAt?: unknown;
     };
-    const pid = typeof owner.pid === "number" ? owner.pid : 0;
-    const createdAt = typeof owner.createdAt === "string" ? Date.parse(owner.createdAt) : Number.NaN;
-    const ageMs = Number.isFinite(createdAt)
-      ? Date.now() - createdAt
-      : MANAGED_BUNDLE_LOCK_STALE_MS + 1;
-    shouldRemove = !isProcessAlive(pid) || ageMs > MANAGED_BUNDLE_LOCK_STALE_MS;
+    const pid = typeof owner.pid === "number" && Number.isInteger(owner.pid) && owner.pid > 0
+      ? owner.pid
+      : null;
+    if (pid === null) {
+      const stat = await statIfExists(lockPath);
+      shouldRemove = !stat || Date.now() - stat.mtimeMs > MANAGED_BUNDLE_LOCK_STALE_MS;
+    } else {
+      shouldRemove = !isProcessAlive(pid);
+    }
   } catch {
     const stat = await statIfExists(lockPath);
     shouldRemove = !stat || Date.now() - stat.mtimeMs > MANAGED_BUNDLE_LOCK_STALE_MS;
