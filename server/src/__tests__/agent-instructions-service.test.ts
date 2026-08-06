@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentInstructionsService } from "../services/agent-instructions.js";
 
 type TestAgent = {
@@ -357,5 +357,165 @@ describe("agent instructions service", () => {
       "Recovered managed instructions entry file from disk as AGENTS.md; previous entry docs/MISSING.md was missing.",
     ]);
     expect(exported.files).toEqual({ "AGENTS.md": "# Managed Agent\n" });
+  });
+
+  it("preserves the whole operator-modified tree during routine materialization", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-drift-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const svc = agentInstructionsService();
+    const agent = makeAgent({});
+
+    const initial = await svc.materializeManagedBundle(agent, {
+      "AGENTS.md": "# Stock v1\n",
+      "docs/STOCK.md": "Stock docs\n",
+    });
+    expect(initial.materialization).toMatchObject({ stockStatus: "missing", action: "added" });
+    const managedRoot = initial.bundle.managedRootPath;
+    await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "# Operator edit\n", "utf8");
+    await fs.writeFile(path.join(managedRoot, "OPERATOR.md"), "Operator-added file\n", "utf8");
+
+    const rebuilt = await svc.materializeManagedBundle(
+      { ...agent, adapterConfig: initial.adapterConfig },
+      {
+        "AGENTS.md": "# Stock v2\n",
+        "docs/STOCK.md": "Updated stock docs\n",
+      },
+    );
+
+    expect(rebuilt.materialization).toMatchObject({
+      stockStatus: "operator_modified",
+      action: "skipped",
+      skipped: ["AGENTS.md", "OPERATOR.md", "docs/STOCK.md"],
+      backupPath: null,
+    });
+    expect(rebuilt.adapterConfig.instructionsStockHash).toBe(initial.adapterConfig.instructionsStockHash);
+    await expect(fs.readFile(path.join(managedRoot, "AGENTS.md"), "utf8")).resolves.toBe("# Operator edit\n");
+    await expect(fs.readFile(path.join(managedRoot, "OPERATOR.md"), "utf8")).resolves.toBe("Operator-added file\n");
+    await expect(fs.readFile(path.join(managedRoot, "docs", "STOCK.md"), "utf8")).resolves.toBe("Stock docs\n");
+  });
+
+  it("atomically advances a clean stock tree and its recorded hash", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-update-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const svc = agentInstructionsService();
+    const agent = makeAgent({});
+    const initial = await svc.materializeManagedBundle(agent, {
+      "AGENTS.md": "# Stock v1\n",
+      "docs/OLD.md": "Old\n",
+    });
+
+    const updated = await svc.materializeManagedBundle(
+      { ...agent, adapterConfig: initial.adapterConfig },
+      {
+        "AGENTS.md": "# Stock v2\n",
+        "docs/NEW.md": "New\n",
+      },
+    );
+
+    expect(updated.materialization).toMatchObject({
+      stockStatus: "stock_update_available",
+      action: "updated",
+      added: ["docs/NEW.md"],
+      removed: ["docs/OLD.md"],
+      updated: ["AGENTS.md"],
+      backupPath: null,
+    });
+    expect(updated.adapterConfig.instructionsStockHash).toBe(updated.materialization.stockHash);
+    expect(updated.adapterConfig.instructionsStockHash).not.toBe(initial.adapterConfig.instructionsStockHash);
+    await expect(fs.readFile(path.join(updated.bundle.managedRootPath, "AGENTS.md"), "utf8")).resolves.toBe("# Stock v2\n");
+    await expect(fs.readFile(path.join(updated.bundle.managedRootPath, "docs", "NEW.md"), "utf8")).resolves.toBe("New\n");
+    await expect(fs.stat(path.join(updated.bundle.managedRootPath, "docs", "OLD.md"))).rejects.toThrow();
+  });
+
+  it("canonicalizes line endings and ignores transient files when classifying drift", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-canonical-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const svc = agentInstructionsService();
+    const agent = makeAgent({});
+    const initial = await svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock\nLine\n" });
+    const managedRoot = initial.bundle.managedRootPath;
+    await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "# Stock\r\nLine\r\n", "utf8");
+    await fs.writeFile(path.join(managedRoot, ".DS_Store"), "transient", "utf8");
+
+    const unchanged = await svc.materializeManagedBundle(
+      { ...agent, adapterConfig: initial.adapterConfig },
+      { "AGENTS.md": "# Stock\nLine\n" },
+    );
+
+    expect(unchanged.materialization).toMatchObject({ stockStatus: "stock_current", action: "unchanged" });
+    await expect(fs.readFile(path.join(managedRoot, "AGENTS.md"), "utf8")).resolves.toBe("# Stock\r\nLine\r\n");
+    await expect(fs.readFile(path.join(managedRoot, ".DS_Store"), "utf8")).resolves.toBe("transient");
+  });
+
+  it("rolls the live tree back when the staged atomic swap fails", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-rollback-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const svc = agentInstructionsService();
+    const agent = makeAgent({});
+    const initial = await svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock v1\n" });
+    const originalRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+      if (path.basename(String(source)) === "staged") throw new Error("simulated swap failure");
+      return originalRename(source, destination);
+    });
+
+    try {
+      await expect(svc.materializeManagedBundle(
+        { ...agent, adapterConfig: initial.adapterConfig },
+        { "AGENTS.md": "# Stock v2\n" },
+      )).rejects.toThrow("simulated swap failure");
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    await expect(fs.readFile(path.join(initial.bundle.managedRootPath, "AGENTS.md"), "utf8")).resolves.toBe("# Stock v1\n");
+  });
+
+  it("backs up operator state before an explicitly requested force reset", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-reset-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const svc = agentInstructionsService();
+    const agent = makeAgent({});
+    const initial = await svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock v1\n" });
+    const managedRoot = initial.bundle.managedRootPath;
+    await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "# Operator edit\n", "utf8");
+    await fs.writeFile(path.join(managedRoot, "OPERATOR.md"), "Keep me\n", "utf8");
+
+    const reset = await svc.forceResetManagedBundle(
+      { ...agent, adapterConfig: initial.adapterConfig },
+      { "AGENTS.md": "# Stock v2\n" },
+    );
+
+    expect(reset.materialization).toMatchObject({
+      stockStatus: "operator_modified",
+      action: "reset",
+      backupPath: `${managedRoot}.backup-1`,
+      backedUp: ["AGENTS.md", "OPERATOR.md"],
+    });
+    await expect(fs.readFile(path.join(`${managedRoot}.backup-1`, "AGENTS.md"), "utf8")).resolves.toBe("# Operator edit\n");
+    await expect(fs.readFile(path.join(`${managedRoot}.backup-1`, "OPERATOR.md"), "utf8")).resolves.toBe("Keep me\n");
+    await expect(fs.readFile(path.join(managedRoot, "AGENTS.md"), "utf8")).resolves.toBe("# Stock v2\n");
+    await expect(fs.stat(path.join(managedRoot, "OPERATOR.md"))).rejects.toThrow();
+
+    await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "# Second operator edit\n", "utf8");
+    const secondReset = await svc.forceResetManagedBundle(
+      { ...agent, adapterConfig: reset.adapterConfig },
+      { "AGENTS.md": "# Stock v3\n" },
+    );
+    expect(secondReset.materialization.backupPath).toBe(`${managedRoot}.backup-2`);
+    await expect(fs.readFile(path.join(`${managedRoot}.backup-1`, "AGENTS.md"), "utf8")).resolves.toBe("# Operator edit\n");
+    await expect(fs.readFile(path.join(`${managedRoot}.backup-2`, "AGENTS.md"), "utf8")).resolves.toBe(
+      "# Second operator edit\n",
+    );
   });
 });

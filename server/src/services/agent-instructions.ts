@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { resourceStatus } from "./managed-resource-drift.js";
+import type { ManagedResourceStockStatus } from "./managed-resource-drift.js";
 
 const ENTRY_FILE_DEFAULT = "AGENTS.md";
 const MODE_KEY = "instructionsBundleMode";
@@ -9,6 +12,7 @@ const ROOT_KEY = "instructionsRootPath";
 const ENTRY_KEY = "instructionsEntryFile";
 const FILE_KEY = "instructionsFilePath";
 const PROMPT_KEY = "promptTemplate";
+const STOCK_HASH_KEY = "instructionsStockHash";
 /** @deprecated Use the managed instructions bundle system instead. */
 const BOOTSTRAP_PROMPT_KEY = "bootstrapPromptTemplate";
 const LEGACY_PROMPT_TEMPLATE_PATH = "promptTemplate.legacy.md";
@@ -63,6 +67,20 @@ type AgentInstructionsBundle = {
   legacyPromptTemplateActive: boolean;
   legacyBootstrapPromptTemplateActive: boolean;
   files: AgentInstructionsFileSummary[];
+};
+
+export type ManagedBundleMaterialization = {
+  stockStatus: ManagedResourceStockStatus;
+  action: "added" | "updated" | "unchanged" | "skipped" | "reset";
+  stockHash: string;
+  previousHash: string | null;
+  recordedStockHash: string | null;
+  added: string[];
+  removed: string[];
+  updated: string[];
+  skipped: string[];
+  backedUp: string[];
+  backupPath: string | null;
 };
 
 type BundleState = {
@@ -191,7 +209,80 @@ async function listFilesRecursive(rootPath: string): Promise<string[]> {
   }
 
   await walk(rootPath, "");
-  return output.sort((left, right) => left.localeCompare(right));
+  return output.sort(compareInstructionPaths);
+}
+
+function canonicalizeInstructionsContent(content: string) {
+  return content.replace(/\r\n?/g, "\n");
+}
+
+function compareInstructionPaths(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+export function managedInstructionsTreeHash(files: Record<string, string>) {
+  const canonicalEntries = Object.entries(files)
+    .map(([relativePath, content]) => [
+      normalizeRelativeFilePath(relativePath),
+      canonicalizeInstructionsContent(content),
+    ] as const)
+    .sort(([left], [right]) => compareInstructionPaths(left, right));
+  const canonicalJson = `{${canonicalEntries
+    .map(([relativePath, content]) => `${JSON.stringify(relativePath)}:${JSON.stringify(content)}`)
+    .join(",")}}`;
+  return `sha256:${createHash("sha256").update(canonicalJson).digest("hex")}`;
+}
+
+async function readInstructionsTree(rootPath: string): Promise<Record<string, string> | null> {
+  const rootStat = await statIfExists(rootPath);
+  if (!rootStat) return null;
+  if (!rootStat.isDirectory()) return {};
+  const relativePaths = await listFilesRecursive(rootPath);
+  return Object.fromEntries(await Promise.all(relativePaths.map(async (relativePath) => [
+    relativePath,
+    await fs.readFile(resolvePathWithinRoot(rootPath, relativePath), "utf8"),
+  ] as const)));
+}
+
+function normalizeMaterializedFiles(files: Record<string, string>, entryFile: string) {
+  const normalized = new Map<string, string>();
+  for (const [relativePath, content] of Object.entries(files)) {
+    const normalizedPath = normalizeRelativeFilePath(relativePath);
+    if (normalized.has(normalizedPath)) {
+      throw unprocessable(`Duplicate instructions file path after normalization: ${normalizedPath}`);
+    }
+    normalized.set(normalizedPath, content);
+  }
+  if (!normalized.has(entryFile)) normalized.set(entryFile, "");
+  return Object.fromEntries(
+    [...normalized.entries()].sort(([left], [right]) => compareInstructionPaths(left, right)),
+  );
+}
+
+function changedInstructionFiles(current: Record<string, string>, prospective: Record<string, string>) {
+  const added: string[] = [];
+  const removed: string[] = [];
+  const updated: string[] = [];
+  const paths = [...new Set([...Object.keys(current), ...Object.keys(prospective)])]
+    .sort(compareInstructionPaths);
+  for (const relativePath of paths) {
+    const hasCurrent = Object.prototype.hasOwnProperty.call(current, relativePath);
+    const hasProspective = Object.prototype.hasOwnProperty.call(prospective, relativePath);
+    if (!hasCurrent && hasProspective) added.push(relativePath);
+    else if (hasCurrent && !hasProspective) removed.push(relativePath);
+    else if (
+      canonicalizeInstructionsContent(current[relativePath]!)
+      !== canonicalizeInstructionsContent(prospective[relativePath]!)
+    ) updated.push(relativePath);
+  }
+  return { added, removed, updated };
+}
+
+async function nextInstructionsBackupPath(rootPath: string) {
+  for (let index = 1; ; index += 1) {
+    const candidate = `${rootPath}.backup-${index}`;
+    if (!(await statIfExists(candidate))) return candidate;
+  }
 }
 
 async function readFileSummary(rootPath: string, relativePath: string, entryFile: string): Promise<AgentInstructionsFileSummary> {
@@ -344,7 +435,7 @@ function toBundle(agent: AgentLike, state: BundleState, files: AgentInstructions
       virtual: true,
     });
   }
-  nextFiles.sort((left, right) => left.path.localeCompare(right.path));
+  nextFiles.sort((left, right) => compareInstructionPaths(left.path, right.path));
   return {
     agentId: agent.id,
     companyId: agent.companyId,
@@ -381,6 +472,7 @@ function applyBundleConfig(
     delete next[PROMPT_KEY];
     delete next[BOOTSTRAP_PROMPT_KEY];
   }
+  if (input.mode === "external") delete next[STOCK_HASH_KEY];
   return next;
 }
 
@@ -439,6 +531,7 @@ export function syncInstructionsBundleConfigFromFilePath(
     delete next[MODE_KEY];
     delete next[ROOT_KEY];
     delete next[ENTRY_KEY];
+    delete next[STOCK_HASH_KEY];
     return next;
   }
   const resolvedPath = resolveLegacyInstructionsPath(instructionsFilePath, adapterConfig);
@@ -682,44 +775,181 @@ export function agentInstructionsService() {
     };
   }
 
+  async function materializeManagedBundleInternal(
+    agent: AgentLike,
+    files: Record<string, string>,
+    options?: {
+      clearLegacyPromptTemplate?: boolean;
+      entryFile?: string;
+      recordedStockHash?: string | null;
+      forceReset?: boolean;
+    },
+  ): Promise<{
+    bundle: AgentInstructionsBundle;
+    adapterConfig: Record<string, unknown>;
+    materialization: ManagedBundleMaterialization;
+  }> {
+    const rootPath = resolveManagedInstructionsRoot(agent);
+    const entryFile = options?.entryFile ? normalizeRelativeFilePath(options.entryFile) : ENTRY_FILE_DEFAULT;
+    await fs.mkdir(path.dirname(rootPath), { recursive: true });
+
+    const prospectiveFiles = normalizeMaterializedFiles(files, entryFile);
+    const stockHash = managedInstructionsTreeHash(prospectiveFiles);
+    const configuredStockHash = asString(asRecord(agent.adapterConfig)[STOCK_HASH_KEY]);
+    const recordedStockHash = options?.recordedStockHash ?? configuredStockHash;
+    const initialFiles = await readInstructionsTree(rootPath);
+    const initialHash = initialFiles === null ? null : managedInstructionsTreeHash(initialFiles);
+    const initialStatus = resourceStatus({
+      resourceId: initialFiles === null ? null : agent.id,
+      currentHash: initialHash,
+      bindingStockHash: recordedStockHash,
+      latestStockHash: stockHash,
+    });
+    const configuredEntryFile = deriveBundleState(agent).entryFile;
+    const preservedEntryFile = (currentFiles: Record<string, string>) => {
+      if (Object.prototype.hasOwnProperty.call(currentFiles, entryFile)) return entryFile;
+      if (Object.prototype.hasOwnProperty.call(currentFiles, configuredEntryFile)) return configuredEntryFile;
+      if (Object.prototype.hasOwnProperty.call(currentFiles, ENTRY_FILE_DEFAULT)) return ENTRY_FILE_DEFAULT;
+      return Object.keys(currentFiles).sort(compareInstructionPaths)[0] ?? entryFile;
+    };
+    const configFor = (advanceStockHash: boolean, currentFiles: Record<string, string>) => {
+      const next = applyBundleConfig(asRecord(agent.adapterConfig), {
+        mode: "managed",
+        rootPath,
+        entryFile: advanceStockHash ? entryFile : preservedEntryFile(currentFiles),
+        clearLegacyPromptTemplate: options?.clearLegacyPromptTemplate,
+      });
+      if (advanceStockHash) next[STOCK_HASH_KEY] = stockHash;
+      return next;
+    };
+
+    const finish = async (
+      action: ManagedBundleMaterialization["action"],
+      stockStatus: ManagedResourceStockStatus,
+      currentFiles: Record<string, string>,
+      currentHash: string | null,
+      input: { advanceStockHash: boolean; backupPath?: string | null },
+    ) => {
+      const changes = changedInstructionFiles(currentFiles, prospectiveFiles);
+      const backupPath = input.backupPath ?? null;
+      const adapterConfig = configFor(input.advanceStockHash, currentFiles);
+      const bundle = await getBundle({ ...agent, adapterConfig });
+      const changedPaths = [...changes.added, ...changes.removed, ...changes.updated]
+        .sort(compareInstructionPaths);
+      return {
+        bundle,
+        adapterConfig,
+        materialization: {
+          stockStatus,
+          action,
+          stockHash,
+          previousHash: currentHash,
+          recordedStockHash,
+          ...changes,
+          skipped: action === "skipped" ? changedPaths : [],
+          backedUp: backupPath ? Object.keys(currentFiles).sort(compareInstructionPaths) : [],
+          backupPath,
+        },
+      };
+    };
+
+    if (!options?.forceReset && initialStatus === "operator_modified") {
+      return finish("skipped", initialStatus, initialFiles ?? {}, initialHash, { advanceStockHash: false });
+    }
+    if (!options?.forceReset && initialStatus === "stock_current") {
+      return finish("unchanged", initialStatus, initialFiles ?? {}, initialHash, { advanceStockHash: true });
+    }
+
+    const stagingRoot = await fs.mkdtemp(path.join(path.dirname(rootPath), ".instructions-materialize-"));
+    const stagedPath = path.join(stagingRoot, "staged");
+    await fs.mkdir(stagedPath, { recursive: true });
+    try {
+      await writeBundleFiles(stagedPath, prospectiveFiles, { overwriteExisting: true });
+      const stagedFiles = await readInstructionsTree(stagedPath);
+      if (!stagedFiles || managedInstructionsTreeHash(stagedFiles) !== stockHash) {
+        throw new Error("Staged instructions bundle hash did not match the prospective stock hash");
+      }
+
+      const recheckedFiles = await readInstructionsTree(rootPath);
+      const recheckedHash = recheckedFiles === null ? null : managedInstructionsTreeHash(recheckedFiles);
+      const recheckedStatus = resourceStatus({
+        resourceId: recheckedFiles === null ? null : agent.id,
+        currentHash: recheckedHash,
+        bindingStockHash: recordedStockHash,
+        latestStockHash: stockHash,
+      });
+      if (!options?.forceReset && recheckedStatus === "operator_modified") {
+        return finish("skipped", recheckedStatus, recheckedFiles ?? {}, recheckedHash, { advanceStockHash: false });
+      }
+      if (!options?.forceReset && recheckedStatus === "stock_current") {
+        return finish("unchanged", recheckedStatus, recheckedFiles ?? {}, recheckedHash, { advanceStockHash: true });
+      }
+
+      const backupPath = options?.forceReset && recheckedFiles !== null
+        ? await nextInstructionsBackupPath(rootPath)
+        : null;
+      const displacedPath = recheckedFiles === null
+        ? null
+        : backupPath ?? path.join(stagingRoot, "previous");
+      if (displacedPath) {
+        await fs.rename(rootPath, displacedPath);
+        if (!options?.forceReset) {
+          const displacedFiles = await readInstructionsTree(displacedPath);
+          const displacedHash = displacedFiles === null ? null : managedInstructionsTreeHash(displacedFiles);
+          if (displacedHash !== recheckedHash) {
+            await fs.rename(displacedPath, rootPath);
+            return finish("skipped", "operator_modified", displacedFiles ?? {}, displacedHash, {
+              advanceStockHash: false,
+            });
+          }
+        }
+      }
+
+      try {
+        await fs.rename(stagedPath, rootPath);
+      } catch (error) {
+        if (displacedPath && !(await statIfExists(rootPath))) {
+          await fs.rename(displacedPath, rootPath).catch(() => undefined);
+        }
+        throw error;
+      }
+
+      const action: ManagedBundleMaterialization["action"] = options?.forceReset
+        ? "reset"
+        : recheckedStatus === "missing"
+          ? "added"
+          : "updated";
+      return finish(action, recheckedStatus, recheckedFiles ?? {}, recheckedHash, {
+        advanceStockHash: true,
+        backupPath,
+      });
+    } finally {
+      await fs.rm(stagingRoot, { recursive: true, force: true });
+    }
+  }
+
   async function materializeManagedBundle(
     agent: AgentLike,
     files: Record<string, string>,
     options?: {
       clearLegacyPromptTemplate?: boolean;
-      replaceExisting?: boolean;
       entryFile?: string;
+      recordedStockHash?: string | null;
     },
-  ): Promise<{ bundle: AgentInstructionsBundle; adapterConfig: Record<string, unknown> }> {
-    const rootPath = resolveManagedInstructionsRoot(agent);
-    const entryFile = options?.entryFile ? normalizeRelativeFilePath(options.entryFile) : ENTRY_FILE_DEFAULT;
+  ) {
+    return materializeManagedBundleInternal(agent, files, options);
+  }
 
-    if (options?.replaceExisting) {
-      await fs.rm(rootPath, { recursive: true, force: true });
-    }
-    await fs.mkdir(rootPath, { recursive: true });
-
-    const normalizedEntries = Object.entries(files).map(([relativePath, content]) => [
-      normalizeRelativeFilePath(relativePath),
-      content,
-    ] as const);
-    for (const [relativePath, content] of normalizedEntries) {
-      const absolutePath = resolvePathWithinRoot(rootPath, relativePath);
-      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-      await fs.writeFile(absolutePath, content, "utf8");
-    }
-    if (!normalizedEntries.some(([relativePath]) => relativePath === entryFile)) {
-      await fs.writeFile(resolvePathWithinRoot(rootPath, entryFile), "", "utf8");
-    }
-
-    const adapterConfig = applyBundleConfig(asRecord(agent.adapterConfig), {
-      mode: "managed",
-      rootPath,
-      entryFile,
-      clearLegacyPromptTemplate: options?.clearLegacyPromptTemplate,
-    });
-    const bundle = await getBundle({ ...agent, adapterConfig });
-    return { bundle, adapterConfig };
+  async function forceResetManagedBundle(
+    agent: AgentLike,
+    files: Record<string, string>,
+    options?: {
+      clearLegacyPromptTemplate?: boolean;
+      entryFile?: string;
+      recordedStockHash?: string | null;
+    },
+  ) {
+    return materializeManagedBundleInternal(agent, files, { ...options, forceReset: true });
   }
 
   return {
@@ -731,5 +961,6 @@ export function agentInstructionsService() {
     exportFiles,
     ensureManagedBundle: ensureWritableBundle,
     materializeManagedBundle,
+    forceResetManagedBundle,
   };
 }

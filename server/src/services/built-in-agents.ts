@@ -11,7 +11,7 @@ import { syncRoutineVariablesWithTemplate } from "@paperclipai/shared";
 import type { Agent, Approval, CompanySkill, PermissionKey, Routine, RoutineTrigger, RoutineVariable } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
-import { agentInstructionsService } from "./agent-instructions.js";
+import { agentInstructionsService, managedInstructionsTreeHash } from "./agent-instructions.js";
 import { agentService } from "./agents.js";
 import { approvalService } from "./approvals.js";
 import {
@@ -22,6 +22,8 @@ import { companySkillService } from "./company-skills.js";
 import { routineService } from "./routines.js";
 import { accessService } from "./access.js";
 import { listAdapterModels } from "../adapters/registry.js";
+import { resourceStatus } from "./managed-resource-drift.js";
+import type { ManagedResourceStockStatus } from "./managed-resource-drift.js";
 
 export type BuiltInAgentStatus = "not_provisioned" | "pending_approval" | "needs_setup" | "ready" | "paused";
 
@@ -72,11 +74,7 @@ export interface BuiltInAgentProvisionResult {
 }
 
 export type BuiltInManagedResourceKind = "instructions" | "skill" | "routine";
-export type BuiltInManagedResourceStockStatus =
-  | "missing"
-  | "stock_current"
-  | "stock_update_available"
-  | "operator_modified";
+export type BuiltInManagedResourceStockStatus = ManagedResourceStockStatus;
 
 export interface BuiltInManagedResourceState {
   resourceKind: BuiltInManagedResourceKind;
@@ -517,20 +515,6 @@ function changedFileList(currentFiles: Record<string, string | null>, stockFiles
     .sort((left, right) => left.localeCompare(right));
 }
 
-function resourceStatus(input: {
-  resourceId: string | null;
-  currentHash: string | null;
-  bindingStockHash: string | null;
-  latestStockHash: string;
-}): BuiltInManagedResourceStockStatus {
-  if (!input.resourceId || !input.currentHash) return "missing";
-  if (input.currentHash === input.latestStockHash) return "stock_current";
-  if (input.bindingStockHash && input.currentHash === input.bindingStockHash) {
-    return "stock_update_available";
-  }
-  return "operator_modified";
-}
-
 function stockState(input: {
   resourceKind: BuiltInManagedResourceKind;
   resourceKey: string;
@@ -964,11 +948,17 @@ export function builtInAgentService(db: Db) {
 
   async function currentInstructionFiles(agent: Agent, bundle: BuiltInAgentBundleDefinition) {
     const currentFiles: Record<string, string | null> = {};
-    for (const filePath of Object.keys(bundle.instructions.files)) {
+    const currentBundle = await instructionsSvc.getBundle(agent);
+    const diskFiles = currentBundle.files.filter((file) => !file.virtual);
+    if (diskFiles.length === 0) {
+      for (const filePath of Object.keys(bundle.instructions.files)) currentFiles[filePath] = null;
+      return currentFiles;
+    }
+    for (const file of diskFiles) {
       try {
-        currentFiles[filePath] = (await instructionsSvc.readFile(agent, filePath)).content;
+        currentFiles[file.path] = (await instructionsSvc.readFile(agent, file.path)).content;
       } catch {
-        currentFiles[filePath] = null;
+        currentFiles[file.path] = null;
       }
     }
     return currentFiles;
@@ -976,10 +966,12 @@ export function builtInAgentService(db: Db) {
 
   async function materializeInstructions(agent: Agent, definition: BuiltInAgentDefinition, mode: "reconcile" | "reset") {
     const bundle = definition.bundle!;
-    const stock = stockHash(bundle.instructions.files);
+    const stock = managedInstructionsTreeHash(bundle.instructions.files);
     const binding = await getManagedResourceBinding(agent.companyId, definition.key, "instructions", "AGENTS.md");
     const currentFiles = await currentInstructionFiles(agent, bundle);
-    const currentHash = Object.values(currentFiles).some((value) => value === null) ? null : stockHash(currentFiles);
+    const currentHash = Object.values(currentFiles).some((value) => value === null)
+      ? null
+      : managedInstructionsTreeHash(currentFiles as Record<string, string>);
     const currentState = stockState({
       resourceKind: "instructions",
       resourceKey: "AGENTS.md",
@@ -991,54 +983,55 @@ export function builtInAgentService(db: Db) {
       changedFiles: changedFileList(currentFiles, bundle.instructions.files),
     });
 
-    const shouldWrite =
-      mode === "reset"
-      || currentState.stockStatus === "missing"
-      || currentState.stockStatus === "stock_update_available";
-    if (!shouldWrite) {
-      if (!binding && currentHash === stock) {
-        await upsertManagedResourceBinding({
-          companyId: agent.companyId,
-          bundleKey: definition.key,
-          resourceKind: "instructions",
-          resourceKey: "AGENTS.md",
-          resourceId: agent.id,
-          stockVersion: bundle.stockVersion,
-          stockHash: stock,
-          defaultsJson: {
-            entryFile: bundle.instructions.entryFile,
-            files: Object.keys(bundle.instructions.files),
-          },
-        });
-      }
-      return currentState;
-    }
-
-    const materialized = await instructionsSvc.materializeManagedBundle(agent, bundle.instructions.files, {
+    const materializeOptions = {
       entryFile: bundle.instructions.entryFile,
-      replaceExisting: true,
       clearLegacyPromptTemplate: true,
-    });
-    const updated = await agentSvc.update(agent.id, {
-      adapterConfig: materialized.adapterConfig,
-    }, {
-      allowBuiltInAgentMetadata: true,
-      recordRevision: { source: `built-in-bundle:${mode}:instructions` },
-    });
-    if (!updated) throw notFound("Built-in agent not found");
-    await upsertManagedResourceBinding({
-      companyId: agent.companyId,
-      bundleKey: definition.key,
-      resourceKind: "instructions",
-      resourceKey: "AGENTS.md",
-      resourceId: agent.id,
-      stockVersion: bundle.stockVersion,
-      stockHash: stock,
-      defaultsJson: {
-        entryFile: bundle.instructions.entryFile,
-        files: Object.keys(bundle.instructions.files),
-      },
-    });
+      recordedStockHash: binding?.stockHash ?? null,
+    };
+    const materialized = mode === "reset"
+      ? await instructionsSvc.forceResetManagedBundle(agent, bundle.instructions.files, materializeOptions)
+      : await instructionsSvc.materializeManagedBundle(agent, bundle.instructions.files, materializeOptions);
+    if (stableJson(materialized.adapterConfig) !== stableJson(agent.adapterConfig)) {
+      const updated = await agentSvc.update(agent.id, {
+        adapterConfig: materialized.adapterConfig,
+      }, {
+        allowBuiltInAgentMetadata: true,
+        recordRevision: { source: `built-in-bundle:${mode}:instructions` },
+      });
+      if (!updated) throw notFound("Built-in agent not found");
+    }
+    const stockControlled = materialized.materialization.action !== "skipped";
+    if (stockControlled) {
+      await upsertManagedResourceBinding({
+        companyId: agent.companyId,
+        bundleKey: definition.key,
+        resourceKind: "instructions",
+        resourceKey: "AGENTS.md",
+        resourceId: agent.id,
+        stockVersion: bundle.stockVersion,
+        stockHash: stock,
+        defaultsJson: {
+          entryFile: bundle.instructions.entryFile,
+          files: Object.keys(bundle.instructions.files),
+        },
+      });
+    }
+    if (materialized.materialization.action !== "unchanged") {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "built-in-agents",
+        action: "built_in_agent.instructions_materialized",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          key: definition.key,
+          mode,
+          ...materialized.materialization,
+        },
+      });
+    }
+    if (!stockControlled) return currentState;
     return stockState({
       resourceKind: "instructions",
       resourceKey: "AGENTS.md",
@@ -1451,7 +1444,7 @@ export function builtInAgentService(db: Db) {
     const { routine, triggers } = await getRoutineByBinding(companyId, definition);
     const proposal = await pendingUpdateProposal(agent);
     const instructionHash = Object.values(instructionFiles).every((value) => value !== null)
-      ? stockHash(instructionFiles)
+      ? managedInstructionsTreeHash(instructionFiles as Record<string, string>)
       : null;
     const skillHash = skill && Object.values(skillFiles).every((value) => value !== null)
       ? stockHash(skillFiles)
@@ -1470,7 +1463,7 @@ export function builtInAgentService(db: Db) {
         resourceKey: "AGENTS.md",
         resourceId: agent.id,
         stockVersion: bundle.stockVersion,
-        latestStockHash: stockHash(bundle.instructions.files),
+        latestStockHash: managedInstructionsTreeHash(bundle.instructions.files),
         currentHash: instructionHash,
         bindingStockHash: instructionBinding?.stockHash ?? null,
         changedFiles: changedFileList(instructionFiles, bundle.instructions.files),
