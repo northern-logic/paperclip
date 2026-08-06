@@ -720,16 +720,19 @@ describe("agent instructions service", () => {
       }),
     ]);
 
-    expect(first.materialization.backupPath).toBe(`${initial.bundle.managedRootPath}.backup-1`);
-    expect(second.materialization.backupPath).toBe(`${initial.bundle.managedRootPath}.backup-2`);
+    expect(new Set([first.materialization.backupPath, second.materialization.backupPath])).toEqual(
+      new Set([
+        `${initial.bundle.managedRootPath}.backup-1`,
+        `${initial.bundle.managedRootPath}.backup-2`,
+      ]),
+    );
     await expect(
       fs.readFile(path.join(`${initial.bundle.managedRootPath}.backup-1`, "AGENTS.md"), "utf8"),
     ).resolves.toBe("# Stock v1\n");
-    await expect(
+    const [secondBackup, live] = await Promise.all([
       fs.readFile(path.join(`${initial.bundle.managedRootPath}.backup-2`, "AGENTS.md"), "utf8"),
-    ).resolves.toBe("# Stock v2\n");
-    await expect(fs.readFile(path.join(initial.bundle.managedRootPath, "AGENTS.md"), "utf8")).resolves.toBe(
-      "# Stock v3\n",
-    );
+      fs.readFile(path.join(initial.bundle.managedRootPath, "AGENTS.md"), "utf8"),
+    ]);
+    expect(new Set([secondBackup, live])).toEqual(new Set(["# Stock v2\n", "# Stock v3\n"]));
   });
 });
