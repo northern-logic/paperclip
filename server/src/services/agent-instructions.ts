@@ -189,9 +189,20 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-async function processStartMarker(pid: number): Promise<string | null> {
+type ProcessStartMarkerScheme = "linux" | "ps";
+
+function processStartMarkerScheme(marker: string): ProcessStartMarkerScheme | null {
+  if (marker.startsWith("linux:")) return "linux";
+  if (marker.startsWith("ps:")) return "ps";
+  return null;
+}
+
+async function processStartMarker(
+  pid: number,
+  preferredScheme?: ProcessStartMarkerScheme,
+): Promise<string | null> {
   if (!isProcessAlive(pid)) return null;
-  if (process.platform === "linux") {
+  if (process.platform === "linux" && preferredScheme !== "ps") {
     try {
       const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
       const commandEnd = stat.lastIndexOf(")");
@@ -203,7 +214,10 @@ async function processStartMarker(pid: number): Promise<string | null> {
     } catch {
       // Fall through to ps for non-standard procfs environments.
     }
+    if (preferredScheme === "linux") return null;
   }
+
+  if (preferredScheme === "linux") return null;
 
   return new Promise((resolve) => {
     execFile(
@@ -287,7 +301,8 @@ async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> 
       const recordedStart = typeof owner.processStartMarker === "string"
         ? owner.processStartMarker
         : null;
-      const currentStart = await processStartMarker(pid);
+      const recordedScheme = recordedStart ? processStartMarkerScheme(recordedStart) : null;
+      const currentStart = await processStartMarker(pid, recordedScheme ?? undefined);
       if (
         recordedStart
         && currentStart

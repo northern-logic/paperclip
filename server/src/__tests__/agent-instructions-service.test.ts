@@ -620,7 +620,9 @@ describe("agent instructions service", () => {
     ]);
 
     expect(firstOutcome).toBe("waiting");
-    await fs.rm(lockPath, { recursive: true, force: true });
+    const releasedLockPath = `${lockPath}.released`;
+    await fs.rename(lockPath, releasedLockPath);
+    await fs.rm(releasedLockPath, { recursive: true, force: true });
     await expect(materialization).resolves.toMatchObject({
       materialization: { action: "added" },
     });
@@ -667,7 +669,7 @@ describe("agent instructions service", () => {
   });
 
   it.skipIf(process.platform !== "linux")(
-    "does not evict a live lock with a stale heartbeat when identity falls back to another scheme",
+    "does not evict a live lock with a stale heartbeat when its identity scheme is unavailable",
     async () => {
       const paperclipHome = await makeTempDir("paperclip-agent-instructions-marker-fallback-");
       cleanupDirs.add(paperclipHome);
@@ -693,7 +695,7 @@ describe("agent instructions service", () => {
         `${JSON.stringify({
           pid: process.pid,
           token,
-          processStartMarker: "ps:same-live-process-in-another-format",
+          processStartMarker: "unavailable:same-live-process-in-another-format",
           createdAt: new Date().toISOString(),
         })}\n`,
         "utf8",
@@ -710,10 +712,53 @@ describe("agent instructions service", () => {
       ]);
 
       expect(firstOutcome).toBe("waiting");
-      await fs.rm(lockPath, { recursive: true, force: true });
+      const releasedLockPath = `${lockPath}.released`;
+      await fs.rename(lockPath, releasedLockPath);
+      await fs.rm(releasedLockPath, { recursive: true, force: true });
       await expect(materialization).resolves.toMatchObject({
         materialization: { action: "added" },
       });
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "recovers a reused PID when the owner recorded the ps fallback scheme",
+    async () => {
+      const paperclipHome = await makeTempDir("paperclip-agent-instructions-ps-reused-pid-");
+      cleanupDirs.add(paperclipHome);
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+      const svc = agentInstructionsService();
+      const agent = makeAgent({});
+      const managedRoot = path.join(
+        paperclipHome,
+        "instances",
+        "test-instance",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "instructions",
+      );
+      const lockPath = `${managedRoot}.paperclip-materialize.lock`;
+      const token = "00000000-0000-4000-8000-000000000000";
+      await fs.mkdir(lockPath, { recursive: true });
+      await fs.writeFile(
+        path.join(lockPath, "owner.json"),
+        `${JSON.stringify({
+          pid: process.pid,
+          token,
+          processStartMarker: "ps:not-the-current-process-start",
+          createdAt: new Date().toISOString(),
+        })}\n`,
+        "utf8",
+      );
+      await fs.writeFile(path.join(lockPath, `heartbeat-${token}`), "", "utf8");
+
+      const result = await svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock\n" });
+
+      expect(result.materialization.action).toBe("added");
+      await expect(fs.stat(lockPath)).rejects.toThrow();
     },
   );
 
