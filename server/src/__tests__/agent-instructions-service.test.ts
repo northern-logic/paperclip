@@ -667,7 +667,7 @@ describe("agent instructions service", () => {
   });
 
   it.skipIf(process.platform !== "linux")(
-    "does not evict a live lock when process identity falls back to another scheme",
+    "does not evict a live lock with a stale heartbeat when identity falls back to another scheme",
     async () => {
       const paperclipHome = await makeTempDir("paperclip-agent-instructions-marker-fallback-");
       cleanupDirs.add(paperclipHome);
@@ -698,7 +698,10 @@ describe("agent instructions service", () => {
         })}\n`,
         "utf8",
       );
-      await fs.writeFile(path.join(lockPath, `heartbeat-${token}`), "", "utf8");
+      const heartbeatPath = path.join(lockPath, `heartbeat-${token}`);
+      await fs.writeFile(heartbeatPath, "", "utf8");
+      const staleHeartbeat = new Date(Date.now() - 60_000);
+      await fs.utimes(heartbeatPath, staleHeartbeat, staleHeartbeat);
 
       const materialization = svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock\n" });
       const firstOutcome = await Promise.race([

@@ -278,14 +278,10 @@ async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> 
     ownerSnapshot = await fs.readFile(path.join(lockPath, "owner.json"), "utf8");
     const owner = JSON.parse(ownerSnapshot) as {
       pid?: unknown;
-      token?: unknown;
       processStartMarker?: unknown;
     };
     const pid = typeof owner.pid === "number" && Number.isInteger(owner.pid) && owner.pid > 0
       ? owner.pid
-      : null;
-    const token = typeof owner.token === "string" && /^[0-9a-f-]{36}$/i.test(owner.token)
-      ? owner.token
       : null;
     if (pid !== null && isProcessAlive(pid)) {
       const recordedStart = typeof owner.processStartMarker === "string"
@@ -298,12 +294,11 @@ async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> 
         && processStartMarkersComparable(recordedStart, currentStart)
       ) {
         shouldRemove = recordedStart !== currentStart;
-      } else if (token) {
-        shouldRemove = await managedBundleLockAgeMs(
-          path.join(lockPath, `heartbeat-${token}`),
-        ) > MANAGED_BUNDLE_LOCK_STALE_MS;
       } else {
-        shouldRemove = await managedBundleLockAgeMs(lockPath) > MANAGED_BUNDLE_LOCK_STALE_MS;
+        // A delayed heartbeat does not prove that a live process has stopped
+        // materializing. Only a comparable process-start marker can safely
+        // distinguish a reused PID from the original owner.
+        shouldRemove = false;
       }
     } else if (pid !== null) {
       shouldRemove = true;
