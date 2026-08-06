@@ -223,6 +223,46 @@ async function managedBundleLockAgeMs(targetPath: string): Promise<number> {
   return stat ? Date.now() - stat.mtimeMs : Number.POSITIVE_INFINITY;
 }
 
+async function restoreManagedBundleLockOwner(ownerPath: string, claimedOwnerPath: string): Promise<void> {
+  await fs.rename(claimedOwnerPath, ownerPath).catch(() => undefined);
+}
+
+async function claimManagedBundleLockOwner(
+  lockPath: string,
+  expectedOwner: string,
+  purpose: "release" | "reap",
+): Promise<string | null> {
+  const ownerPath = path.join(lockPath, "owner.json");
+  const claimedOwnerPath = path.join(lockPath, `owner.${purpose}-${randomUUID()}.json`);
+  try {
+    await fs.rename(ownerPath, claimedOwnerPath);
+  } catch {
+    return null;
+  }
+
+  const claimedOwner = await fs.readFile(claimedOwnerPath, "utf8").catch(() => null);
+  if (claimedOwner !== expectedOwner) {
+    await restoreManagedBundleLockOwner(ownerPath, claimedOwnerPath);
+    return null;
+  }
+  return claimedOwnerPath;
+}
+
+async function claimOwnerlessManagedBundleLock(lockPath: string): Promise<string | null> {
+  const ownerPath = path.join(lockPath, "owner.json");
+  const claimPath = path.join(lockPath, "owner.reaping");
+  try {
+    await fs.writeFile(claimPath, randomUUID(), { encoding: "utf8", flag: "wx" });
+  } catch {
+    return null;
+  }
+  if (await statIfExists(ownerPath)) {
+    await fs.rm(claimPath, { force: true }).catch(() => undefined);
+    return null;
+  }
+  return claimPath;
+}
+
 function processStartMarkersComparable(left: string, right: string): boolean {
   const leftSeparator = left.indexOf(":");
   const rightSeparator = right.indexOf(":");
@@ -233,8 +273,10 @@ function processStartMarkersComparable(left: string, right: string): boolean {
 
 async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> {
   let shouldRemove = false;
+  let ownerSnapshot: string | null = null;
   try {
-    const owner = JSON.parse(await fs.readFile(path.join(lockPath, "owner.json"), "utf8")) as {
+    ownerSnapshot = await fs.readFile(path.join(lockPath, "owner.json"), "utf8");
+    const owner = JSON.parse(ownerSnapshot) as {
       pid?: unknown;
       token?: unknown;
       processStartMarker?: unknown;
@@ -272,8 +314,20 @@ async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> 
     shouldRemove = await managedBundleLockAgeMs(lockPath) > MANAGED_BUNDLE_LOCK_STALE_MS;
   }
   if (!shouldRemove) return false;
-  await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
-  return true;
+  const claimPath = ownerSnapshot === null
+    ? await claimOwnerlessManagedBundleLock(lockPath)
+    : await claimManagedBundleLockOwner(lockPath, ownerSnapshot, "reap");
+  if (!claimPath) return false;
+  return fs.rm(lockPath, { recursive: true, force: true })
+    .then(() => true)
+    .catch(async () => {
+      if (ownerSnapshot !== null) {
+        await restoreManagedBundleLockOwner(path.join(lockPath, "owner.json"), claimPath);
+      } else {
+        await fs.rm(claimPath, { force: true }).catch(() => undefined);
+      }
+      return false;
+    });
 }
 
 async function withManagedBundleMaterializationLock<T>(
@@ -326,11 +380,23 @@ async function withManagedBundleMaterializationLock<T>(
     return await operation();
   } finally {
     clearInterval(heartbeat);
-    const owner = await fs.readFile(ownerPath, "utf8")
-      .then((raw) => JSON.parse(raw) as { token?: unknown })
-      .catch(() => null);
-    if (owner?.token === token) {
-      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+    const ownerSnapshot = await fs.readFile(ownerPath, "utf8").catch(() => null);
+    const owner = ownerSnapshot === null
+      ? null
+      : (() => {
+          try {
+            return JSON.parse(ownerSnapshot) as { token?: unknown };
+          } catch {
+            return null;
+          }
+        })();
+    if (owner?.token === token && ownerSnapshot !== null) {
+      const claimPath = await claimManagedBundleLockOwner(lockPath, ownerSnapshot, "release");
+      if (claimPath) {
+        await fs.rm(lockPath, { recursive: true, force: true }).catch(async () => {
+          await restoreManagedBundleLockOwner(ownerPath, claimPath);
+        });
+      }
     }
   }
 }

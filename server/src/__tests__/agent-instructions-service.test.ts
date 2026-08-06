@@ -489,6 +489,48 @@ describe("agent instructions service", () => {
     await expect(fs.stat(lockPath)).rejects.toThrow();
   });
 
+  it("lets only one contender reap a stale managed materialization lock", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-stale-lock-race-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const agent = makeAgent({});
+    const managedRoot = path.join(
+      paperclipHome,
+      "instances",
+      "test-instance",
+      "companies",
+      "company-1",
+      "agents",
+      "agent-1",
+      "instructions",
+    );
+    const lockPath = `${managedRoot}.paperclip-materialize.lock`;
+    await fs.mkdir(lockPath, { recursive: true });
+    await fs.writeFile(
+      path.join(lockPath, "owner.json"),
+      `${JSON.stringify({
+        pid: 2_147_483_647,
+        token: "00000000-0000-4000-8000-000000000000",
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      "utf8",
+    );
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, index) => agentInstructionsService().materializeManagedBundle(
+        agent,
+        { "AGENTS.md": `# Stock ${index}\n` },
+      )),
+    );
+
+    expect(results.filter((result) => result.materialization.action === "added")).toHaveLength(1);
+    expect(results.filter((result) => result.materialization.action === "skipped")).toHaveLength(7);
+    await expect(fs.stat(lockPath)).rejects.toThrow();
+    const live = await fs.readFile(path.join(managedRoot, "AGENTS.md"), "utf8");
+    expect(Array.from({ length: 8 }, (_, index) => `# Stock ${index}\n`)).toContain(live);
+  });
+
   it("does not evict an old materialization lock owned by a live process", async () => {
     const paperclipHome = await makeTempDir("paperclip-agent-instructions-live-lock-");
     cleanupDirs.add(paperclipHome);
