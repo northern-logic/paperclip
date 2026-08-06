@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
@@ -33,6 +34,8 @@ const MANAGED_BUNDLE_LOCK_SUFFIX = ".paperclip-materialize.lock";
 const MANAGED_BUNDLE_LOCK_TIMEOUT_MS = 30_000;
 const MANAGED_BUNDLE_LOCK_HEARTBEAT_MS = 1_000;
 const MANAGED_BUNDLE_LOCK_STALE_MS = 10_000;
+const MANAGED_BUNDLE_LOCK_PROBE_CACHE_MS = 1_000;
+const managedBundleProbeConfirmedAt = new Map<string, number>();
 
 type BundleMode = "managed" | "external";
 
@@ -237,6 +240,75 @@ async function managedBundleLockAgeMs(targetPath: string): Promise<number> {
   return stat ? Date.now() - stat.mtimeMs : Number.POSITIVE_INFINITY;
 }
 
+function managedBundleLockProbePath(token: string): string {
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\paperclip-managed-bundle-${token}`;
+  }
+  if (process.platform === "linux") {
+    return `\0paperclip-managed-bundle-${token}`;
+  }
+  return path.join("/tmp", `.paperclip-managed-bundle-${token}.sock`);
+}
+
+function managedBundleLockProbeHasFilesystemPath(): boolean {
+  return process.platform !== "win32" && process.platform !== "linux";
+}
+
+async function startManagedBundleLockProbe(token: string): Promise<{
+  path: string;
+  server: net.Server;
+}> {
+  const probePath = managedBundleLockProbePath(token);
+  const server = net.createServer((socket) => socket.destroy());
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => reject(error);
+    server.once("error", onError);
+    server.listen(probePath, () => {
+      server.off("error", onError);
+      server.on("error", () => undefined);
+      server.unref();
+      resolve();
+    });
+  });
+  return { path: probePath, server };
+}
+
+async function stopManagedBundleLockProbe(probe: {
+  path: string;
+  server: net.Server;
+}): Promise<void> {
+  await new Promise<void>((resolve) => probe.server.close(() => resolve()));
+  managedBundleProbeConfirmedAt.delete(probe.path);
+  if (managedBundleLockProbeHasFilesystemPath()) {
+    await fs.rm(probe.path, { force: true }).catch(() => undefined);
+  }
+}
+
+async function managedBundleLockProbeIsAlive(probePath: string): Promise<boolean> {
+  const confirmedAt = managedBundleProbeConfirmedAt.get(probePath);
+  if (confirmedAt !== undefined && Date.now() - confirmedAt < MANAGED_BUNDLE_LOCK_PROBE_CACHE_MS) {
+    return true;
+  }
+
+  const alive = await new Promise<boolean>((resolve) => {
+    const socket = net.createConnection(probePath);
+    let settled = false;
+    const finish = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
+    socket.unref();
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(250, () => finish(false));
+  });
+  if (alive) managedBundleProbeConfirmedAt.set(probePath, Date.now());
+  else managedBundleProbeConfirmedAt.delete(probePath);
+  return alive;
+}
+
 async function restoreManagedBundleLockOwner(ownerPath: string, claimedOwnerPath: string): Promise<void> {
   await fs.rename(claimedOwnerPath, ownerPath).catch(() => undefined);
 }
@@ -288,16 +360,29 @@ function processStartMarkersComparable(left: string, right: string): boolean {
 async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> {
   let shouldRemove = false;
   let ownerSnapshot: string | null = null;
+  let staleProbePath: string | null = null;
   try {
     ownerSnapshot = await fs.readFile(path.join(lockPath, "owner.json"), "utf8");
     const owner = JSON.parse(ownerSnapshot) as {
       pid?: unknown;
+      token?: unknown;
+      probePath?: unknown;
       processStartMarker?: unknown;
     };
     const pid = typeof owner.pid === "number" && Number.isInteger(owner.pid) && owner.pid > 0
       ? owner.pid
       : null;
-    if (pid !== null && isProcessAlive(pid)) {
+    const token = typeof owner.token === "string" && /^[0-9a-f-]{36}$/i.test(owner.token)
+      ? owner.token
+      : null;
+    const probePath = token !== null
+      && owner.probePath === managedBundleLockProbePath(token)
+      ? owner.probePath
+      : null;
+    if (probePath !== null) {
+      shouldRemove = !(await managedBundleLockProbeIsAlive(probePath));
+      if (shouldRemove) staleProbePath = probePath;
+    } else if (pid !== null && isProcessAlive(pid)) {
       const recordedStart = typeof owner.processStartMarker === "string"
         ? owner.processStartMarker
         : null;
@@ -329,7 +414,15 @@ async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> 
     : await claimManagedBundleLockOwner(lockPath, ownerSnapshot, "reap");
   if (!claimPath) return false;
   return fs.rm(lockPath, { recursive: true, force: true })
-    .then(() => true)
+    .then(async () => {
+      if (staleProbePath !== null) {
+        managedBundleProbeConfirmedAt.delete(staleProbePath);
+        if (managedBundleLockProbeHasFilesystemPath()) {
+          await fs.rm(staleProbePath, { force: true }).catch(() => undefined);
+        }
+      }
+      return true;
+    })
     .catch(async () => {
       if (ownerSnapshot !== null) {
         await restoreManagedBundleLockOwner(path.join(lockPath, "owner.json"), claimPath);
@@ -351,6 +444,7 @@ async function withManagedBundleMaterializationLock<T>(
   const pendingLockPath = `${lockPath}.pending-${token}`;
   const ownerProcessStartMarker = await processStartMarker(process.pid);
   const deadline = Date.now() + MANAGED_BUNDLE_LOCK_TIMEOUT_MS;
+  const probe = await startManagedBundleLockProbe(token);
   await fs.mkdir(path.dirname(rootPath), { recursive: true });
   try {
     await fs.mkdir(pendingLockPath);
@@ -359,6 +453,7 @@ async function withManagedBundleMaterializationLock<T>(
       `${JSON.stringify({
         pid: process.pid,
         token,
+        probePath: probe.path,
         processStartMarker: ownerProcessStartMarker,
         createdAt: new Date().toISOString(),
       })}\n`,
@@ -380,6 +475,7 @@ async function withManagedBundleMaterializationLock<T>(
     }
   } catch (error) {
     await fs.rm(pendingLockPath, { recursive: true, force: true }).catch(() => undefined);
+    await stopManagedBundleLockProbe(probe);
     throw error;
   }
 
@@ -410,6 +506,7 @@ async function withManagedBundleMaterializationLock<T>(
         });
       }
     }
+    await stopManagedBundleLockProbe(probe);
   }
 }
 

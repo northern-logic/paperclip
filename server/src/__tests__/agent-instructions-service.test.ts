@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -688,13 +690,21 @@ describe("agent instructions service", () => {
         "instructions",
       );
       const lockPath = `${managedRoot}.paperclip-materialize.lock`;
-      const token = "00000000-0000-4000-8000-000000000000";
+      const token = randomUUID();
+      const probePath = `\0paperclip-managed-bundle-${token}`;
+      const probe = net.createServer((socket) => socket.destroy());
+      await new Promise<void>((resolve, reject) => {
+        probe.once("error", reject);
+        probe.listen(probePath, resolve);
+      });
+      probe.unref();
       await fs.mkdir(lockPath, { recursive: true });
       await fs.writeFile(
         path.join(lockPath, "owner.json"),
         `${JSON.stringify({
           pid: process.pid,
           token,
+          probePath,
           processStartMarker: "unavailable:same-live-process-in-another-format",
           createdAt: new Date().toISOString(),
         })}\n`,
@@ -714,6 +724,7 @@ describe("agent instructions service", () => {
       expect(firstOutcome).toBe("waiting");
       const releasedLockPath = `${lockPath}.released`;
       await fs.rename(lockPath, releasedLockPath);
+      await new Promise<void>((resolve) => probe.close(() => resolve()));
       await fs.rm(releasedLockPath, { recursive: true, force: true });
       await expect(materialization).resolves.toMatchObject({
         materialization: { action: "added" },
@@ -722,7 +733,7 @@ describe("agent instructions service", () => {
   );
 
   it.skipIf(process.platform !== "linux")(
-    "recovers a reused PID when the owner recorded the ps fallback scheme",
+    "recovers a reused PID after its liveness probe is released",
     async () => {
       const paperclipHome = await makeTempDir("paperclip-agent-instructions-ps-reused-pid-");
       cleanupDirs.add(paperclipHome);
@@ -741,14 +752,16 @@ describe("agent instructions service", () => {
         "instructions",
       );
       const lockPath = `${managedRoot}.paperclip-materialize.lock`;
-      const token = "00000000-0000-4000-8000-000000000000";
+      const token = randomUUID();
+      const probePath = `\0paperclip-managed-bundle-${token}`;
       await fs.mkdir(lockPath, { recursive: true });
       await fs.writeFile(
         path.join(lockPath, "owner.json"),
         `${JSON.stringify({
           pid: process.pid,
           token,
-          processStartMarker: "ps:not-the-current-process-start",
+          probePath,
+          processStartMarker: "unavailable:not-the-current-process-start",
           createdAt: new Date().toISOString(),
         })}\n`,
         "utf8",
