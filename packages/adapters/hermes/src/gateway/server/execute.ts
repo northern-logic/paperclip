@@ -24,6 +24,7 @@ import {
   isRemotePlainHttp,
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
+import { ensureGatewaySkillsReady, HermesGatewaySkillError } from "./skills.js";
 
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
@@ -800,6 +801,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorCode: "hermes_gateway_api_key_missing",
       errorMessage: "Hermes gateway adapter requires apiKey.",
+    };
+  }
+
+  try {
+    await ensureGatewaySkillsReady({
+      agentId: ctx.agent.id,
+      companyId: ctx.agent.companyId,
+      adapterType: ADAPTER_TYPE,
+      config: ctx.config,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.onLog("stderr", `[hermes-gateway] skill preflight failed: ${message}\n`);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: error instanceof HermesGatewaySkillError
+        ? error.code
+        : "hermes_gateway_skill_sync_failed",
+      errorMessage: message,
     };
   }
 

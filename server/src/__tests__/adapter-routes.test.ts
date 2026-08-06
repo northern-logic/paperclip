@@ -234,9 +234,9 @@ describe("adapter routes", () => {
     expect(hermesGateway.source).toBe("builtin");
     expect(hermesGateway.capabilities).toMatchObject({
       supportsInstructionsBundle: false,
-      supportsSkills: false,
+      supportsSkills: true,
       supportsLocalAgentJwt: false,
-      requiresMaterializedRuntimeSkills: false,
+      requiresMaterializedRuntimeSkills: true,
       supportsAcp: false,
     });
   });
@@ -403,6 +403,9 @@ describe("adapter routes", () => {
       expect.arrayContaining([
         expect.objectContaining({ key: "apiBaseUrl", required: true }),
         expect.objectContaining({ key: "apiKey", required: true }),
+        expect.objectContaining({ key: "profile", default: "default" }),
+        expect.objectContaining({ key: "managementCredential", meta: { secret: true } }),
+        expect.objectContaining({ key: "skillBridgeCredential", meta: { secret: true } }),
       ]),
     );
   });

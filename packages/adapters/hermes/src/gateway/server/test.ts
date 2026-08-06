@@ -10,6 +10,7 @@ import {
   isRemotePlainHttp,
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
+import { testGatewaySkillServices } from "./skills.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -120,6 +121,8 @@ export async function testEnvironment(
       message: "Loopback HTTP Hermes gateway URL is allowed.",
     });
   }
+
+  checks.push(...await testGatewaySkillServices(ctx.config));
 
   if (checks.some((check) => check.level === "error") || !parsed || !apiKey) {
     return {

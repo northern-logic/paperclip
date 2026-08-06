@@ -37,6 +37,9 @@ test("root package export keeps explicit local and gateway adapter factories", (
   expect(hermesGatewayType).toBe("hermes_gateway");
   expect(gatewayAdapter.supportsLocalAgentJwt).toBe(false);
   expect(gatewayAdapter.supportsInstructionsBundle).toBe(false);
+  expect(gatewayAdapter.requiresMaterializedRuntimeSkills).toBe(true);
+  expect(typeof gatewayAdapter.listSkills).toBe("function");
+  expect(typeof gatewayAdapter.syncSkills).toBe("function");
 });
 
 test("gateway subpath export exposes the Hermes Gateway adapter entrypoint", () => {
@@ -48,6 +51,8 @@ test("gateway subpath export exposes the Hermes Gateway adapter entrypoint", () 
   expect(typeof adapter.sessionCodec?.deserialize).toBe("function");
   expect(adapter.sessionManagement?.nativeContextManagement).toBe("confirmed");
   expect(typeof adapter.getConfigSchema).toBe("function");
+  expect(typeof adapter.listSkills).toBe("function");
+  expect(typeof adapter.syncSkills).toBe("function");
 });
 
 test("Hermes adapter exposes bundled Paperclip task bridge skill", async () => {

@@ -80,6 +80,29 @@ describe("parseSseFramesForTest", () => {
 });
 
 describe("execute", () => {
+  it("fails closed before creating a run when assigned skills cannot be synchronized", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ run_id: "unexpected" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      paperclipSkillSync: { desiredSkills: ["marketing"] },
+      paperclipRuntimeSkills: [{
+        key: "marketing",
+        runtimeName: "marketing",
+        source: "/missing/marketing",
+        sourceStatus: "missing",
+      }],
+    }));
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "hermes_gateway_skill_management_unconfigured",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects remote plain HTTP unless the unsafe dev escape hatch is enabled", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ run_id: "unexpected" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
