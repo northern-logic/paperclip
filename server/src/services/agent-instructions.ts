@@ -28,6 +28,7 @@ const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
   "node_modules",
   "venv",
 ]);
+const managedBundleMaterializationTails = new Map<string, Promise<void>>();
 
 type BundleMode = "managed" | "external";
 
@@ -172,6 +173,29 @@ function resolveLegacyInstructionsPath(candidatePath: string, config: Record<str
 
 async function statIfExists(targetPath: string) {
   return fs.stat(targetPath).catch(() => null);
+}
+
+async function withManagedBundleMaterializationLock<T>(
+  rootPath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = managedBundleMaterializationTails.get(rootPath) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => current);
+  managedBundleMaterializationTails.set(rootPath, tail);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (managedBundleMaterializationTails.get(rootPath) === tail) {
+      managedBundleMaterializationTails.delete(rootPath);
+    }
+  }
 }
 
 function shouldIgnoreInstructionsEntry(entry: { name: string; isDirectory(): boolean; isFile(): boolean }) {
@@ -937,7 +961,10 @@ export function agentInstructionsService() {
       recordedStockHash?: string | null;
     },
   ) {
-    return materializeManagedBundleInternal(agent, files, options);
+    const rootPath = resolveManagedInstructionsRoot(agent);
+    return withManagedBundleMaterializationLock(rootPath, () =>
+      materializeManagedBundleInternal(agent, files, options),
+    );
   }
 
   async function forceResetManagedBundle(
@@ -949,7 +976,10 @@ export function agentInstructionsService() {
       recordedStockHash?: string | null;
     },
   ) {
-    return materializeManagedBundleInternal(agent, files, { ...options, forceReset: true });
+    const rootPath = resolveManagedInstructionsRoot(agent);
+    return withManagedBundleMaterializationLock(rootPath, () =>
+      materializeManagedBundleInternal(agent, files, { ...options, forceReset: true }),
+    );
   }
 
   return {

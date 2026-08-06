@@ -431,6 +431,33 @@ describe("agent instructions service", () => {
     await expect(fs.stat(path.join(updated.bundle.managedRootPath, "docs", "OLD.md"))).rejects.toThrow();
   });
 
+  it("serializes concurrent routine materializations for the same agent", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-concurrent-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const svc = agentInstructionsService();
+    const agent = makeAgent({});
+    const initial = await svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock v1\n" });
+    const configuredAgent = { ...agent, adapterConfig: initial.adapterConfig };
+
+    const [first, second] = await Promise.all([
+      svc.materializeManagedBundle(configuredAgent, { "AGENTS.md": "# Stock v2\n" }),
+      agentInstructionsService().materializeManagedBundle(configuredAgent, {
+        "AGENTS.md": "# Stock v3\n",
+      }),
+    ]);
+
+    expect(first.materialization.action).toBe("updated");
+    expect(second.materialization).toMatchObject({
+      stockStatus: "operator_modified",
+      action: "skipped",
+    });
+    await expect(fs.readFile(path.join(initial.bundle.managedRootPath, "AGENTS.md"), "utf8")).resolves.toBe(
+      "# Stock v2\n",
+    );
+  });
+
   it("canonicalizes line endings and ignores transient files when classifying drift", async () => {
     const paperclipHome = await makeTempDir("paperclip-agent-instructions-canonical-");
     cleanupDirs.add(paperclipHome);
@@ -516,6 +543,36 @@ describe("agent instructions service", () => {
     await expect(fs.readFile(path.join(`${managedRoot}.backup-1`, "AGENTS.md"), "utf8")).resolves.toBe("# Operator edit\n");
     await expect(fs.readFile(path.join(`${managedRoot}.backup-2`, "AGENTS.md"), "utf8")).resolves.toBe(
       "# Second operator edit\n",
+    );
+  });
+
+  it("allocates distinct backups for concurrent force resets", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-concurrent-reset-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const svc = agentInstructionsService();
+    const agent = makeAgent({});
+    const initial = await svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock v1\n" });
+    const configuredAgent = { ...agent, adapterConfig: initial.adapterConfig };
+
+    const [first, second] = await Promise.all([
+      svc.forceResetManagedBundle(configuredAgent, { "AGENTS.md": "# Stock v2\n" }),
+      agentInstructionsService().forceResetManagedBundle(configuredAgent, {
+        "AGENTS.md": "# Stock v3\n",
+      }),
+    ]);
+
+    expect(first.materialization.backupPath).toBe(`${initial.bundle.managedRootPath}.backup-1`);
+    expect(second.materialization.backupPath).toBe(`${initial.bundle.managedRootPath}.backup-2`);
+    await expect(
+      fs.readFile(path.join(`${initial.bundle.managedRootPath}.backup-1`, "AGENTS.md"), "utf8"),
+    ).resolves.toBe("# Stock v1\n");
+    await expect(
+      fs.readFile(path.join(`${initial.bundle.managedRootPath}.backup-2`, "AGENTS.md"), "utf8"),
+    ).resolves.toBe("# Stock v2\n");
+    await expect(fs.readFile(path.join(initial.bundle.managedRootPath, "AGENTS.md"), "utf8")).resolves.toBe(
+      "# Stock v3\n",
     );
   });
 });
