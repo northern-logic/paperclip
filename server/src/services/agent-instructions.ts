@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { notFound, unprocessable } from "../errors.js";
@@ -28,7 +28,9 @@ const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
   "node_modules",
   "venv",
 ]);
-const managedBundleMaterializationTails = new Map<string, Promise<void>>();
+const MANAGED_BUNDLE_LOCK_SUFFIX = ".paperclip-materialize.lock";
+const MANAGED_BUNDLE_LOCK_TIMEOUT_MS = 30_000;
+const MANAGED_BUNDLE_LOCK_STALE_MS = 5 * 60_000;
 
 type BundleMode = "managed" | "external";
 
@@ -175,25 +177,79 @@ async function statIfExists(targetPath: string) {
   return fs.stat(targetPath).catch(() => null);
 }
 
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> {
+  let shouldRemove = false;
+  try {
+    const owner = JSON.parse(await fs.readFile(path.join(lockPath, "owner.json"), "utf8")) as {
+      pid?: unknown;
+      createdAt?: unknown;
+    };
+    const pid = typeof owner.pid === "number" ? owner.pid : 0;
+    const createdAt = typeof owner.createdAt === "string" ? Date.parse(owner.createdAt) : Number.NaN;
+    const ageMs = Number.isFinite(createdAt)
+      ? Date.now() - createdAt
+      : MANAGED_BUNDLE_LOCK_STALE_MS + 1;
+    shouldRemove = !isProcessAlive(pid) || ageMs > MANAGED_BUNDLE_LOCK_STALE_MS;
+  } catch {
+    const stat = await statIfExists(lockPath);
+    shouldRemove = !stat || Date.now() - stat.mtimeMs > MANAGED_BUNDLE_LOCK_STALE_MS;
+  }
+  if (!shouldRemove) return false;
+  await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+  return true;
+}
+
 async function withManagedBundleMaterializationLock<T>(
   rootPath: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const previous = managedBundleMaterializationTails.get(rootPath) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const tail = previous.catch(() => undefined).then(() => current);
-  managedBundleMaterializationTails.set(rootPath, tail);
+  const lockPath = `${rootPath}${MANAGED_BUNDLE_LOCK_SUFFIX}`;
+  const ownerPath = path.join(lockPath, "owner.json");
+  const token = randomUUID();
+  const deadline = Date.now() + MANAGED_BUNDLE_LOCK_TIMEOUT_MS;
+  await fs.mkdir(path.dirname(rootPath), { recursive: true });
+  while (true) {
+    try {
+      await fs.mkdir(lockPath);
+      try {
+        await fs.writeFile(
+          ownerPath,
+          `${JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() })}\n`,
+          "utf8",
+        );
+      } catch (error) {
+        await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+      }
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await removeStaleManagedBundleLock(lockPath)) continue;
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for managed instructions lock at ${lockPath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
 
-  await previous.catch(() => undefined);
   try {
     return await operation();
   } finally {
-    release();
-    if (managedBundleMaterializationTails.get(rootPath) === tail) {
-      managedBundleMaterializationTails.delete(rootPath);
+    const owner = await fs.readFile(ownerPath, "utf8")
+      .then((raw) => JSON.parse(raw) as { token?: unknown })
+      .catch(() => null);
+    if (owner?.token === token) {
+      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 }
