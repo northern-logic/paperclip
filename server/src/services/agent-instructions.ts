@@ -338,37 +338,39 @@ async function withManagedBundleMaterializationLock<T>(
   const ownerPath = path.join(lockPath, "owner.json");
   const token = randomUUID();
   const heartbeatPath = path.join(lockPath, `heartbeat-${token}`);
+  const pendingLockPath = `${lockPath}.pending-${token}`;
   const ownerProcessStartMarker = await processStartMarker(process.pid);
   const deadline = Date.now() + MANAGED_BUNDLE_LOCK_TIMEOUT_MS;
   await fs.mkdir(path.dirname(rootPath), { recursive: true });
-  while (true) {
-    try {
-      await fs.mkdir(lockPath);
+  try {
+    await fs.mkdir(pendingLockPath);
+    await fs.writeFile(
+      path.join(pendingLockPath, "owner.json"),
+      `${JSON.stringify({
+        pid: process.pid,
+        token,
+        processStartMarker: ownerProcessStartMarker,
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      "utf8",
+    );
+    await fs.writeFile(path.join(pendingLockPath, `heartbeat-${token}`), "", "utf8");
+    while (true) {
       try {
-        await fs.writeFile(
-          ownerPath,
-          `${JSON.stringify({
-            pid: process.pid,
-            token,
-            processStartMarker: ownerProcessStartMarker,
-            createdAt: new Date().toISOString(),
-          })}\n`,
-          "utf8",
-        );
-        await fs.writeFile(heartbeatPath, "", "utf8");
+        await fs.rename(pendingLockPath, lockPath);
+        break;
       } catch (error) {
-        await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
-        throw error;
+        if (!(await statIfExists(lockPath))) throw error;
+        if (await removeStaleManagedBundleLock(lockPath)) continue;
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting for managed instructions lock at ${lockPath}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
       }
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (await removeStaleManagedBundleLock(lockPath)) continue;
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for managed instructions lock at ${lockPath}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
     }
+  } catch (error) {
+    await fs.rm(pendingLockPath, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
   }
 
   const heartbeat = setInterval(() => {

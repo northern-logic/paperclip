@@ -531,6 +531,63 @@ describe("agent instructions service", () => {
     expect(Array.from({ length: 8 }, (_, index) => `# Stock ${index}\n`)).toContain(live);
   });
 
+  it("publishes owner metadata atomically with the materialization lock", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-lock-publish-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const agent = makeAgent({});
+    const managedRoot = path.join(
+      paperclipHome,
+      "instances",
+      "test-instance",
+      "companies",
+      "company-1",
+      "agents",
+      "agent-1",
+      "instructions",
+    );
+    const lockPath = `${managedRoot}.paperclip-materialize.lock`;
+    const originalRename = fs.rename.bind(fs);
+    let pendingLockPath: string | null = null;
+    let publish: (() => void) | null = null;
+    const publishAllowed = new Promise<void>((resolve) => {
+      publish = resolve;
+    });
+    let pendingReady: (() => void) | null = null;
+    const pendingPrepared = new Promise<void>((resolve) => {
+      pendingReady = resolve;
+    });
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+      if (String(source).startsWith(`${lockPath}.pending-`) && String(destination) === lockPath) {
+        pendingLockPath = String(source);
+        pendingReady?.();
+        await publishAllowed;
+      }
+      return originalRename(source, destination);
+    });
+    const materialization = agentInstructionsService().materializeManagedBundle(
+      agent,
+      { "AGENTS.md": "# Stock\n" },
+    );
+
+    try {
+      await pendingPrepared;
+      await expect(fs.stat(lockPath)).rejects.toThrow();
+      expect(pendingLockPath).not.toBeNull();
+      await expect(fs.readFile(path.join(pendingLockPath!, "owner.json"), "utf8")).resolves.toContain(
+        `"pid":${process.pid}`,
+      );
+      const pendingFiles = await fs.readdir(pendingLockPath!);
+      expect(pendingFiles.some((file) => file.startsWith("heartbeat-"))).toBe(true);
+    } finally {
+      publish?.();
+    }
+
+    await expect(materialization).resolves.toMatchObject({ materialization: { action: "added" } });
+    renameSpy.mockRestore();
+  });
+
   it("does not evict an old materialization lock owned by a live process", async () => {
     const paperclipHome = await makeTempDir("paperclip-agent-instructions-live-lock-");
     cleanupDirs.add(paperclipHome);
