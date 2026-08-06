@@ -552,7 +552,9 @@ describe("agent instructions service", () => {
       `${JSON.stringify({
         pid: process.pid,
         token,
-        processStartMarker: "not-the-current-process-start",
+        processStartMarker: process.platform === "linux"
+          ? "linux:not-the-current-process-start"
+          : "ps:not-the-current-process-start",
         createdAt: new Date().toISOString(),
       })}\n`,
       "utf8",
@@ -564,6 +566,54 @@ describe("agent instructions service", () => {
     expect(result.materialization.action).toBe("added");
     await expect(fs.stat(lockPath)).rejects.toThrow();
   });
+
+  it.skipIf(process.platform !== "linux")(
+    "does not evict a live lock when process identity falls back to another scheme",
+    async () => {
+      const paperclipHome = await makeTempDir("paperclip-agent-instructions-marker-fallback-");
+      cleanupDirs.add(paperclipHome);
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+      const svc = agentInstructionsService();
+      const agent = makeAgent({});
+      const managedRoot = path.join(
+        paperclipHome,
+        "instances",
+        "test-instance",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "instructions",
+      );
+      const lockPath = `${managedRoot}.paperclip-materialize.lock`;
+      const token = "00000000-0000-4000-8000-000000000000";
+      await fs.mkdir(lockPath, { recursive: true });
+      await fs.writeFile(
+        path.join(lockPath, "owner.json"),
+        `${JSON.stringify({
+          pid: process.pid,
+          token,
+          processStartMarker: "ps:same-live-process-in-another-format",
+          createdAt: new Date().toISOString(),
+        })}\n`,
+        "utf8",
+      );
+      await fs.writeFile(path.join(lockPath, `heartbeat-${token}`), "", "utf8");
+
+      const materialization = svc.materializeManagedBundle(agent, { "AGENTS.md": "# Stock\n" });
+      const firstOutcome = await Promise.race([
+        materialization.then(() => "materialized"),
+        new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 75)),
+      ]);
+
+      expect(firstOutcome).toBe("waiting");
+      await fs.rm(lockPath, { recursive: true, force: true });
+      await expect(materialization).resolves.toMatchObject({
+        materialization: { action: "added" },
+      });
+    },
+  );
 
   it("canonicalizes line endings and ignores transient files when classifying drift", async () => {
     const paperclipHome = await makeTempDir("paperclip-agent-instructions-canonical-");

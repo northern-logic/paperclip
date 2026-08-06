@@ -223,6 +223,14 @@ async function managedBundleLockAgeMs(targetPath: string): Promise<number> {
   return stat ? Date.now() - stat.mtimeMs : Number.POSITIVE_INFINITY;
 }
 
+function processStartMarkersComparable(left: string, right: string): boolean {
+  const leftSeparator = left.indexOf(":");
+  const rightSeparator = right.indexOf(":");
+  return leftSeparator > 0
+    && rightSeparator > 0
+    && left.slice(0, leftSeparator) === right.slice(0, rightSeparator);
+}
+
 async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> {
   let shouldRemove = false;
   try {
@@ -242,7 +250,11 @@ async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> 
         ? owner.processStartMarker
         : null;
       const currentStart = await processStartMarker(pid);
-      if (recordedStart && currentStart) {
+      if (
+        recordedStart
+        && currentStart
+        && processStartMarkersComparable(recordedStart, currentStart)
+      ) {
         shouldRemove = recordedStart !== currentStart;
       } else if (token) {
         shouldRemove = await managedBundleLockAgeMs(
