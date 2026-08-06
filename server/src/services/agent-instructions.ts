@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { notFound, unprocessable } from "../errors.js";
@@ -30,7 +31,8 @@ const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
 ]);
 const MANAGED_BUNDLE_LOCK_SUFFIX = ".paperclip-materialize.lock";
 const MANAGED_BUNDLE_LOCK_TIMEOUT_MS = 30_000;
-const MANAGED_BUNDLE_LOCK_STALE_MS = 5 * 60_000;
+const MANAGED_BUNDLE_LOCK_HEARTBEAT_MS = 1_000;
+const MANAGED_BUNDLE_LOCK_STALE_MS = 10_000;
 
 type BundleMode = "managed" | "external";
 
@@ -187,24 +189,75 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+async function processStartMarker(pid: number): Promise<string | null> {
+  if (!isProcessAlive(pid)) return null;
+  if (process.platform === "linux") {
+    try {
+      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      const fieldsAfterCommand = commandEnd >= 0
+        ? stat.slice(commandEnd + 1).trim().split(/\s+/)
+        : [];
+      const startTime = fieldsAfterCommand[19];
+      if (startTime) return `linux:${startTime}`;
+    } catch {
+      // Fall through to ps for non-standard procfs environments.
+    }
+  }
+
+  return new Promise((resolve) => {
+    execFile(
+      "ps",
+      ["-o", "lstart=", "-p", String(pid)],
+      { timeout: 1_000 },
+      (error, stdout) => {
+        const startedAt = error ? "" : stdout.trim();
+        resolve(startedAt ? `ps:${startedAt}` : null);
+      },
+    );
+  });
+}
+
+async function managedBundleLockAgeMs(targetPath: string): Promise<number> {
+  const stat = await statIfExists(targetPath);
+  return stat ? Date.now() - stat.mtimeMs : Number.POSITIVE_INFINITY;
+}
+
 async function removeStaleManagedBundleLock(lockPath: string): Promise<boolean> {
   let shouldRemove = false;
   try {
     const owner = JSON.parse(await fs.readFile(path.join(lockPath, "owner.json"), "utf8")) as {
       pid?: unknown;
+      token?: unknown;
+      processStartMarker?: unknown;
     };
     const pid = typeof owner.pid === "number" && Number.isInteger(owner.pid) && owner.pid > 0
       ? owner.pid
       : null;
-    if (pid === null) {
-      const stat = await statIfExists(lockPath);
-      shouldRemove = !stat || Date.now() - stat.mtimeMs > MANAGED_BUNDLE_LOCK_STALE_MS;
+    const token = typeof owner.token === "string" && /^[0-9a-f-]{36}$/i.test(owner.token)
+      ? owner.token
+      : null;
+    if (pid !== null && isProcessAlive(pid)) {
+      const recordedStart = typeof owner.processStartMarker === "string"
+        ? owner.processStartMarker
+        : null;
+      const currentStart = await processStartMarker(pid);
+      if (recordedStart && currentStart) {
+        shouldRemove = recordedStart !== currentStart;
+      } else if (token) {
+        shouldRemove = await managedBundleLockAgeMs(
+          path.join(lockPath, `heartbeat-${token}`),
+        ) > MANAGED_BUNDLE_LOCK_STALE_MS;
+      } else {
+        shouldRemove = await managedBundleLockAgeMs(lockPath) > MANAGED_BUNDLE_LOCK_STALE_MS;
+      }
+    } else if (pid !== null) {
+      shouldRemove = true;
     } else {
-      shouldRemove = !isProcessAlive(pid);
+      shouldRemove = await managedBundleLockAgeMs(lockPath) > MANAGED_BUNDLE_LOCK_STALE_MS;
     }
   } catch {
-    const stat = await statIfExists(lockPath);
-    shouldRemove = !stat || Date.now() - stat.mtimeMs > MANAGED_BUNDLE_LOCK_STALE_MS;
+    shouldRemove = await managedBundleLockAgeMs(lockPath) > MANAGED_BUNDLE_LOCK_STALE_MS;
   }
   if (!shouldRemove) return false;
   await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
@@ -218,6 +271,8 @@ async function withManagedBundleMaterializationLock<T>(
   const lockPath = `${rootPath}${MANAGED_BUNDLE_LOCK_SUFFIX}`;
   const ownerPath = path.join(lockPath, "owner.json");
   const token = randomUUID();
+  const heartbeatPath = path.join(lockPath, `heartbeat-${token}`);
+  const ownerProcessStartMarker = await processStartMarker(process.pid);
   const deadline = Date.now() + MANAGED_BUNDLE_LOCK_TIMEOUT_MS;
   await fs.mkdir(path.dirname(rootPath), { recursive: true });
   while (true) {
@@ -226,9 +281,15 @@ async function withManagedBundleMaterializationLock<T>(
       try {
         await fs.writeFile(
           ownerPath,
-          `${JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() })}\n`,
+          `${JSON.stringify({
+            pid: process.pid,
+            token,
+            processStartMarker: ownerProcessStartMarker,
+            createdAt: new Date().toISOString(),
+          })}\n`,
           "utf8",
         );
+        await fs.writeFile(heartbeatPath, "", "utf8");
       } catch (error) {
         await fs.rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
         throw error;
@@ -244,9 +305,15 @@ async function withManagedBundleMaterializationLock<T>(
     }
   }
 
+  const heartbeat = setInterval(() => {
+    const now = new Date();
+    void fs.utimes(heartbeatPath, now, now).catch(() => undefined);
+  }, MANAGED_BUNDLE_LOCK_HEARTBEAT_MS);
+  heartbeat.unref?.();
   try {
     return await operation();
   } finally {
+    clearInterval(heartbeat);
     const owner = await fs.readFile(ownerPath, "utf8")
       .then((raw) => JSON.parse(raw) as { token?: unknown })
       .catch(() => null);
