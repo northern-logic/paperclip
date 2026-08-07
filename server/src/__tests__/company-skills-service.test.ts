@@ -131,6 +131,131 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     });
   });
 
+  it("deletes the owned source directory for a Paperclip-created managed local skill", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const created = await svc.createLocalSkill(companyId, {
+      name: "Owned Skill",
+      slug: "owned-skill",
+      description: "Paperclip owns this skill source.",
+    });
+    const sourceDir = created.sourceLocator!;
+    const managedRoot = path.dirname(sourceDir);
+    const siblingDir = path.join(managedRoot, "keep-sibling");
+    await fs.mkdir(siblingDir, { recursive: true });
+    await fs.writeFile(path.join(siblingDir, "sentinel.txt"), "keep", "utf8");
+
+    await expect(svc.deleteSkill(companyId, created.id)).resolves.toMatchObject({ id: created.id });
+
+    await expect(fs.stat(sourceDir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(managedRoot)).isDirectory()).toBe(true);
+    await expect(fs.readFile(path.join(siblingDir, "sentinel.txt"), "utf8")).resolves.toBe("keep");
+  });
+
+  it("keeps non-owned, out-of-tree, nested, and managed-root skill sources", async () => {
+    const companyId = randomUUID();
+    const externalRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-delete-safety-"));
+    cleanupDirs.add(externalRoot);
+    if (!paperclipHome) throw new Error("Expected Paperclip test home");
+    const managedRoot = path.join(paperclipHome, "instances", "default", "skills", companyId);
+    await fs.mkdir(managedRoot, { recursive: true });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const cases = [
+      {
+        label: "imported local source",
+        slug: "imported-local",
+        sourceType: "local_path",
+        sourceDir: path.join(managedRoot, "imported-local"),
+        metadata: { sourceKind: "local_path" },
+      },
+      {
+        label: "project scan source",
+        slug: "project-scan",
+        sourceType: "local_path",
+        sourceDir: path.join(externalRoot, "project-scan"),
+        metadata: { sourceKind: "project_scan", workspaceCwd: externalRoot },
+      },
+      {
+        label: "catalog source",
+        slug: "catalog-skill",
+        sourceType: "catalog",
+        sourceDir: path.join(managedRoot, "__catalog__", "catalog-skill"),
+        metadata: { sourceKind: "catalog" },
+      },
+      {
+        label: "external source",
+        slug: "external-skill",
+        sourceType: "github",
+        sourceDir: path.join(externalRoot, "external-skill"),
+        metadata: { sourceKind: "github" },
+      },
+      {
+        label: "out-of-tree managed-local source",
+        slug: "spoofed-managed-local",
+        sourceType: "local_path",
+        sourceDir: path.join(externalRoot, "spoofed-managed-local"),
+        metadata: { sourceKind: "managed_local" },
+      },
+      {
+        label: "nested managed-local source",
+        slug: "nested-managed-local",
+        sourceType: "local_path",
+        sourceDir: path.join(managedRoot, "nested", "nested-managed-local"),
+        metadata: { sourceKind: "managed_local" },
+      },
+      {
+        label: "managed root",
+        slug: "managed-root",
+        sourceType: "local_path",
+        sourceDir: managedRoot,
+        metadata: { sourceKind: "managed_local" },
+      },
+    ] as const;
+
+    for (const safetyCase of cases) {
+      const skillId = randomUUID();
+      const sentinelPath = path.join(safetyCase.sourceDir, `${safetyCase.slug}.sentinel`);
+      await fs.mkdir(safetyCase.sourceDir, { recursive: true });
+      await fs.writeFile(path.join(safetyCase.sourceDir, "SKILL.md"), `# ${safetyCase.label}\n`, "utf8");
+      await fs.writeFile(sentinelPath, "keep", "utf8");
+      await db.insert(companySkills).values({
+        id: skillId,
+        companyId,
+        key: `company/${companyId}/${safetyCase.slug}`,
+        slug: safetyCase.slug,
+        name: safetyCase.label,
+        markdown: `# ${safetyCase.label}\n`,
+        sourceType: safetyCase.sourceType,
+        sourceLocator: safetyCase.sourceDir,
+        trustLevel: "markdown_only",
+        compatibility: "compatible",
+        fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+        metadata: safetyCase.metadata,
+      });
+
+      await expect(svc.deleteSkill(companyId, skillId)).resolves.toMatchObject({ id: skillId });
+      await expect(
+        fs.readFile(sentinelPath, "utf8"),
+        `${safetyCase.label} must remain after deleting its library record`,
+      ).resolves.toBe("keep");
+    }
+
+    expect((await fs.stat(managedRoot)).isDirectory()).toBe(true);
+  });
+
   it("optionally enriches list items with latest version editor identities", async () => {
     const companyId = randomUUID();
     const userSkillId = randomUUID();

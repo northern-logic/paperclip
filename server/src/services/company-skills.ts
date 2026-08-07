@@ -2269,6 +2269,22 @@ function resolveManagedSkillsRoot(companyId: string) {
   return path.resolve(resolvePaperclipInstanceRoot(), "skills", companyId);
 }
 
+function resolveOwnedManagedLocalSkillSourcePath(
+  companyId: string,
+  skill: Pick<CompanySkill, "sourceType" | "sourceLocator" | "slug" | "metadata">,
+) {
+  if (skill.sourceType !== "local_path" || getSkillMeta(skill).sourceKind !== "managed_local") {
+    return null;
+  }
+
+  const managedRoot = resolveManagedSkillsRoot(companyId);
+  const sourceDir = normalizeSourceLocatorDirectory(skill.sourceLocator);
+  if (!sourceDir || sourceDir === managedRoot) return null;
+  if (path.dirname(sourceDir) !== managedRoot) return null;
+  if (path.basename(sourceDir) !== skill.slug) return null;
+  return sourceDir;
+}
+
 function resolveLocalSkillFilePath(skill: CompanySkill, relativePath: string) {
   const normalized = normalizePortablePath(relativePath);
   const skillDir = normalizeSkillDirectory(skill);
@@ -6444,6 +6460,8 @@ export function companySkillService(db: Db) {
       );
     }
 
+    const ownedSourcePath = resolveOwnedManagedLocalSkillSourcePath(companyId, skill);
+
     // Delete DB row
     await db
       .delete(companySkills)
@@ -6451,6 +6469,12 @@ export function companySkillService(db: Db) {
 
     // Clean up materialized runtime files
     await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, skill), { recursive: true, force: true });
+
+    // Paperclip-created local skills own their source directory. Imported,
+    // project, catalog, and external sources remain outside this lifecycle.
+    if (ownedSourcePath) {
+      await fs.rm(ownedSourcePath, { recursive: true, force: true });
+    }
 
     return skill;
   }
