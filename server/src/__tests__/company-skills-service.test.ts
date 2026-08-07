@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
@@ -156,6 +156,120 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await expect(fs.stat(sourceDir)).rejects.toMatchObject({ code: "ENOENT" });
     expect((await fs.stat(managedRoot)).isDirectory()).toBe(true);
     await expect(fs.readFile(path.join(siblingDir, "sentinel.txt"), "utf8")).resolves.toBe("keep");
+  });
+
+  it("does not delete newly-created source or runtime paths that reuse a slug while the old delete finishes", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const original = await svc.createLocalSkill(companyId, {
+      name: "Original Skill",
+      slug: "reused-skill",
+    });
+    const managedRoot = path.dirname(original.sourceLocator!);
+    const runtimeName = `${original.slug}--${createHash("sha256").update(original.key).digest("hex").slice(0, 10)}`;
+    const runtimePath = path.join(managedRoot, "__runtime__", runtimeName);
+    const versionPath = path.join(managedRoot, "__versions__", original.id, "materialized-version");
+    await fs.mkdir(runtimePath, { recursive: true });
+    await fs.writeFile(path.join(runtimePath, "old-runtime.txt"), "old", "utf8");
+    await fs.mkdir(versionPath, { recursive: true });
+    await fs.writeFile(path.join(versionPath, "snapshot.txt"), "old version", "utf8");
+    const originalRm = fs.rm.bind(fs);
+    let runtimeCleanupPaused = false;
+    let markRuntimeCleanupStarted!: () => void;
+    let releaseRuntimeCleanup!: () => void;
+    const runtimeCleanupStarted = new Promise<void>((resolve) => {
+      markRuntimeCleanupStarted = resolve;
+    });
+    const runtimeCleanupRelease = new Promise<void>((resolve) => {
+      releaseRuntimeCleanup = resolve;
+    });
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (
+        !runtimeCleanupPaused
+        && String(target).includes(`${path.sep}__runtime__${path.sep}`)
+        && String(target).includes(`deleting-${original.id}`)
+      ) {
+        runtimeCleanupPaused = true;
+        markRuntimeCleanupStarted();
+        await runtimeCleanupRelease;
+      }
+      return originalRm(target, options);
+    });
+
+    try {
+      const deleting = svc.deleteSkill(companyId, original.id);
+      await runtimeCleanupStarted;
+
+      const recreated = await svc.createLocalSkill(companyId, {
+        name: "Recreated Skill",
+        slug: "reused-skill",
+        markdown: "---\nname: Recreated Skill\n---\n\n# Recreated\n",
+      });
+      await fs.mkdir(runtimePath, { recursive: true });
+      await fs.writeFile(path.join(runtimePath, "new-runtime.txt"), "new", "utf8");
+      releaseRuntimeCleanup();
+      await expect(deleting).resolves.toMatchObject({ id: original.id });
+
+      await expect(fs.readFile(path.join(recreated.sourceLocator!, "SKILL.md"), "utf8"))
+        .resolves.toContain("# Recreated");
+      await expect(fs.readFile(path.join(runtimePath, "new-runtime.txt"), "utf8")).resolves.toBe("new");
+      await expect(fs.stat(path.join(managedRoot, "__versions__", original.id)))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      await expect(db.select({ id: companySkills.id }).from(companySkills)
+        .where(eq(companySkills.id, recreated.id)))
+        .resolves.toHaveLength(1);
+      expect((await fs.readdir(managedRoot)).some((entry) => entry.includes(`deleting-${original.id}`))).toBe(false);
+      expect((await fs.readdir(path.dirname(runtimePath)))
+        .some((entry) => entry.includes(`deleting-${original.id}`))).toBe(false);
+    } finally {
+      releaseRuntimeCleanup();
+      rmSpy.mockRestore();
+    }
+  });
+
+  it("restores owned source and runtime paths when deleting the database row fails", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const created = await svc.createLocalSkill(companyId, {
+      name: "Restored Skill",
+      slug: "restored-skill",
+    });
+    const sourceDir = created.sourceLocator!;
+    const managedRoot = path.dirname(sourceDir);
+    const runtimeName = `${created.slug}--${createHash("sha256").update(created.key).digest("hex").slice(0, 10)}`;
+    const runtimePath = path.join(managedRoot, "__runtime__", runtimeName);
+    await fs.mkdir(runtimePath, { recursive: true });
+    await fs.writeFile(path.join(runtimePath, "runtime.txt"), "keep", "utf8");
+    const deleteSpy = vi.spyOn(db, "delete").mockImplementationOnce(() => {
+      throw new Error("injected company skill delete failure");
+    });
+
+    try {
+      await expect(svc.deleteSkill(companyId, created.id)).rejects.toThrow("injected company skill delete failure");
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    await expect(fs.readFile(path.join(sourceDir, "SKILL.md"), "utf8")).resolves.toContain("# Restored Skill");
+    await expect(fs.readFile(path.join(runtimePath, "runtime.txt"), "utf8")).resolves.toBe("keep");
+    await expect(db.select({ id: companySkills.id }).from(companySkills)
+      .where(eq(companySkills.id, created.id)))
+      .resolves.toHaveLength(1);
+    expect((await fs.readdir(path.dirname(sourceDir))).some((entry) => entry.includes(`deleting-${created.id}`))).toBe(false);
+    expect((await fs.readdir(path.dirname(runtimePath)))
+      .some((entry) => entry.includes(`deleting-${created.id}`))).toBe(false);
   });
 
   it("keeps non-owned, out-of-tree, nested, and managed-root skill sources", async () => {
