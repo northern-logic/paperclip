@@ -29,6 +29,13 @@ Keep these credentials distinct:
   `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `MISTRAL_API_KEY`.
 - Hermes gateway key: set `API_SERVER_KEY` before starting Hermes. Paperclip
   stores the same value as `agentDefaultsPayload.apiKey` so it can call Hermes.
+- Hermes dashboard management key: set a stable
+  `HERMES_DASHBOARD_SESSION_TOKEN` on the loopback-only dashboard service.
+  Paperclip stores it as `agentDefaultsPayload.managementCredential` and uses
+  it only for the stock profile-scoped skills API.
+- Northern Logic bundle bridge key: generate a separate bearer credential for
+  the loopback-only skill bridge. Paperclip stores it as
+  `agentDefaultsPayload.skillBridgeCredential`.
 - Paperclip agent key: created after the board approves the join request and
   claimed once by the Hermes agent. Hermes uses this key as
   `PAPERCLIP_API_KEY` when it calls Paperclip.
@@ -52,6 +59,14 @@ The default Hermes API server port is `8642`. For local loopback testing,
 Paperclip can usually store `http://127.0.0.1:8642` as the gateway URL. For
 Docker, LAN, tailnet, or reverse-proxy setups, use a URL reachable by the
 Paperclip server process.
+
+When one Hermes installation serves multiple profiles, enable Hermes'
+stock `gateway.multiplex_profiles` setting and give each Paperclip agent the
+matching profile-prefixed run URL, for example
+`http://127.0.0.1:8642/p/marketing`, together with `profile: "marketing"`.
+The unprefixed listener is the default profile. A dedicated per-profile
+gateway listener is also valid; in that layout, use that listener's URL and
+still set the explicit profile for dashboard and skill-bridge operations.
 
 Plain HTTP is accepted for loopback. Non-loopback HTTP is denied by default in
 the join flow; use HTTPS for real remote gateways. For private local
@@ -96,6 +111,11 @@ Hermes should submit a join request with `requestType: "agent"` and
   "agentDefaultsPayload": {
     "apiBaseUrl": "http://127.0.0.1:8642",
     "apiKey": "<same-value-as-API_SERVER_KEY>",
+    "profile": "default",
+    "managementBaseUrl": "http://127.0.0.1:9119",
+    "managementCredential": "<same-value-as-HERMES_DASHBOARD_SESSION_TOKEN>",
+    "skillBridgeBaseUrl": "http://127.0.0.1:8643",
+    "skillBridgeCredential": "<northern-logic-skill-bridge-key>",
     "paperclipApiUrl": "http://127.0.0.1:3100",
     "sessionKeyStrategy": "issue"
   }
@@ -108,8 +128,48 @@ Important URL roles:
   calls.
 - `agentDefaultsPayload.paperclipApiUrl` is the Paperclip base URL that Hermes
   can call after approval and key claim.
+- `agentDefaultsPayload.managementBaseUrl` is the private stock Hermes
+  dashboard/control URL used for profile-scoped inventory and enable/disable.
+- `agentDefaultsPayload.skillBridgeBaseUrl` is the private Northern Logic
+  bridge used only to atomically install and remove complete multi-file skill
+  bundles. See [HERMES_GATEWAY_SKILLS.md](./HERMES_GATEWAY_SKILLS.md).
 - `PAPERCLIP_API_URL` / `PAPERCLIP_API_KEY` are injected runtime values for
   Hermes-originated Paperclip API calls after the agent is approved.
+
+For non-default profiles, the run URL and management profile must describe the
+same runtime identity. For example, pair `apiBaseUrl` ending in
+`/p/marketing` with `profile: "marketing"`; otherwise Paperclip could verify
+skills for one profile while waking another.
+
+## Provision From An Administrative Portal
+
+The existing Paperclip API is sufficient for Northern Logic provisioning; a
+custom all-in-one provisioning endpoint is not required. Authenticate
+server-to-server requests with an instance-admin board API key in
+`Authorization: Bearer <board-api-key>`. Create that key from an authenticated
+board session with `POST /api/board-api-keys`; its token is returned only when
+created.
+
+For a new tenant/runtime:
+
+1. Create the company with `POST /api/companies` when it does not already
+   exist. This operation requires instance-admin access.
+2. Store `API_SERVER_KEY`, `HERMES_DASHBOARD_SESSION_TOKEN`, and the bridge
+   bearer as three company secrets with
+   `POST /api/companies/:companyId/secrets`.
+3. Create the agent with `POST /api/companies/:companyId/agents`, adapter type
+   `hermes_gateway`, and use `{ "type": "secret_ref", "secretId": "..." }`
+   for `apiKey`, `managementCredential`, and `skillBridgeCredential`.
+4. If Hermes must call Paperclip, create a standard agent key once with
+   `POST /api/agents/:agentId/keys` and install the returned token on that VM
+   as `PAPERCLIP_API_KEY`. Do not use this agent key for portal administration.
+
+Agent creation accepts `desiredSkills` directly. Paperclip resolves those
+company-library keys and versions, persists the desired assignment, and
+materializes the complete directories used by gateway reconciliation. If the
+company requires board approval for new agents, use the existing
+`POST /api/companies/:companyId/agent-hires` approval flow instead of direct
+creation.
 
 ## Approve And Claim
 

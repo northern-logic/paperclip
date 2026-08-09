@@ -68,6 +68,7 @@ vi.mock("../services/environments.js", () => ({
 }));
 
 vi.mock("../adapters/index.js", () => ({
+  findActiveServerAdapter: mockFindServerAdapter,
   findServerAdapter: mockFindServerAdapter,
   listAdapterModels: vi.fn(),
 }));
@@ -99,6 +100,7 @@ function registerModuleMocks() {
   }));
 
   vi.doMock("../adapters/index.js", () => ({
+    findActiveServerAdapter: mockFindServerAdapter,
     findServerAdapter: mockFindServerAdapter,
     listAdapterModels: vi.fn(),
   }));
@@ -202,6 +204,7 @@ describe("agent instructions bundle routes", () => {
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
     mockFindServerAdapter.mockImplementation((_type: string) => ({ type: _type }));
+    mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       reason: "allow_explicit_grant",
@@ -417,6 +420,109 @@ describe("agent instructions bundle routes", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("reads and writes Hermes Gateway instruction files through the remote adapter contract", async () => {
+    const remoteBundle = {
+      mode: "remote" as const,
+      entryFile: "AGENTS.md",
+      editable: true,
+      warnings: [],
+      files: [{
+        path: "AGENTS.md",
+        size: 12,
+        language: "markdown",
+        markdown: true,
+        isEntryFile: true,
+        editable: true,
+        deprecated: false,
+        virtual: false,
+      }],
+    };
+    const getInstructionsBundle = vi.fn().mockResolvedValue(remoteBundle);
+    const readInstructionsFile = vi.fn().mockResolvedValue({
+      ...remoteBundle.files[0],
+      content: "# Remote\n",
+    });
+    const writeInstructionsFile = vi.fn().mockResolvedValue({
+      ...remoteBundle.files[0],
+      size: 17,
+      content: "# Updated Remote\n",
+    });
+    const deleteInstructionsFile = vi.fn().mockResolvedValue(remoteBundle);
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterType: "hermes_gateway",
+      adapterConfig: {
+        profile: "marketing",
+        skillBridgeBaseUrl: "https://bridge.test",
+        skillBridgeCredential: { type: "secret_ref", secretId: "bridge-secret", version: "latest" },
+      },
+    });
+    mockSecretService.resolveAdapterConfigForRuntime.mockResolvedValue({
+      config: {
+        profile: "marketing",
+        skillBridgeBaseUrl: "https://bridge.test",
+        skillBridgeCredential: "resolved-secret",
+      },
+    });
+    mockFindServerAdapter.mockReturnValue({
+      type: "hermes_gateway",
+      supportsInstructionsBundle: true,
+      getInstructionsBundle,
+      readInstructionsFile,
+      writeInstructionsFile,
+      deleteInstructionsFile,
+    });
+
+    const app = await createApp();
+    const bundleResponse = await requestApp(app, (baseUrl) => request(baseUrl)
+      .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle?companyId=company-1"));
+    expect(bundleResponse.status, JSON.stringify(bundleResponse.body)).toBe(200);
+    expect(bundleResponse.body).toMatchObject({
+      mode: "remote",
+      rootPath: null,
+      managedRootPath: "",
+      entryFile: "AGENTS.md",
+    });
+    expect(mockAgentInstructionsService.getBundle).not.toHaveBeenCalled();
+
+    const readResponse = await requestApp(app, (baseUrl) => request(baseUrl)
+      .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file")
+      .query({ path: "AGENTS.md", companyId: "company-1" }));
+    expect(readResponse.status, JSON.stringify(readResponse.body)).toBe(200);
+    expect(readResponse.body.content).toBe("# Remote\n");
+
+    const writeResponse = await requestApp(app, (baseUrl) => request(baseUrl)
+      .put("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file?companyId=company-1")
+      .send({ path: "AGENTS.md", content: "# Updated Remote\n" }));
+    expect(writeResponse.status, JSON.stringify(writeResponse.body)).toBe(200);
+    expect(writeInstructionsFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adapterType: "hermes_gateway",
+        config: expect.objectContaining({ skillBridgeCredential: "resolved-secret" }),
+      }),
+      "AGENTS.md",
+      "# Updated Remote\n",
+    );
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "agent.instructions_file_updated",
+      details: expect.objectContaining({ mode: "remote" }),
+    }));
+
+    const deleteResponse = await requestApp(app, (baseUrl) => request(baseUrl)
+      .delete("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file")
+      .query({ path: "TOOLS.md", companyId: "company-1" }));
+    expect(deleteResponse.status, JSON.stringify(deleteResponse.body)).toBe(200);
+    expect(deleteInstructionsFile).toHaveBeenCalledWith(
+      expect.objectContaining({ adapterType: "hermes_gateway" }),
+      "TOOLS.md",
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "agent.instructions_file_deleted",
+      details: expect.objectContaining({ path: "TOOLS.md", mode: "remote" }),
+    }));
   });
 
   it("preserves managed instructions config when switching adapters", async () => {

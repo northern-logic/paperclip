@@ -126,6 +126,11 @@ Then create an agent with adapter type `hermes_gateway`:
   "adapterConfig": {
     "apiBaseUrl": "http://127.0.0.1:8642",
     "apiKey": "<same-value-as-API_SERVER_KEY>",
+    "profile": "default",
+    "managementBaseUrl": "http://127.0.0.1:9119",
+    "managementCredential": "<same-value-as-HERMES_DASHBOARD_SESSION_TOKEN>",
+    "skillBridgeBaseUrl": "http://127.0.0.1:8643",
+    "skillBridgeCredential": "<northern-logic-skill-bridge-key>",
     "paperclipApiUrl": "http://127.0.0.1:3100",
     "sessionKeyStrategy": "issue",
     "timeoutSec": 600
@@ -143,6 +148,15 @@ runs with `/api/v1/runs` after mapping them to the API base.
 This mode does not start Hermes. It creates runs with `POST /v1/runs`, streams
 Hermes events with SSE, polls run status as a fallback, and stops timed-out runs
 with `POST /v1/runs/{run_id}/stop`.
+
+The four management/bridge fields are optional for a gateway that has no
+Paperclip skill assignments. Once an agent has an assigned company skill, all
+four are required and run creation fails closed until Paperclip can verify the
+skill in the explicit Hermes profile. Both services must remain private; the
+dashboard credential is sent as `X-Hermes-Session-Token`, and the bridge
+credential is sent as a bearer token. See
+[`doc/HERMES_GATEWAY_SKILLS.md`](../../../doc/HERMES_GATEWAY_SKILLS.md) for the
+versioned bridge contract and reconciliation rules.
 
 ### Compatibility with the old gateway package
 
@@ -313,13 +327,23 @@ and migrates session state between runs.
 
 ### Skills Integration
 
-The adapter scans two skill sources and merges them:
+The local adapter scans two skill sources and merges them:
 
 - **Paperclip-managed skills** — bundled with the adapter, togglable from the UI
 - **Hermes-native skills** — from `~/.hermes/skills/`, read-only, always loaded
 
 The `listSkills` / `syncSkills` APIs expose a unified snapshot so the
 Paperclip UI can display both managed and native skills in one view.
+
+The gateway adapter presents the same Paperclip surface without a shared
+filesystem. It reads profile-scoped observed state from the stock Hermes
+dashboard API and sends complete, deterministic skill bundles to the private
+Northern Logic bundle bridge. Paperclip-owned receipts are reconciled by hash;
+Hermes hub, bundled, and agent-created skills remain visible and read-only.
+Paperclip never updates or deletes a skill without an exact
+`companyId`/`agentId` ownership receipt. Bundle-directory `runtimeName` and the
+stock dashboard's YAML-frontmatter `skillName` are tracked separately, and a
+run fails closed until the bridge reports the signed bundle is `in_sync`.
 
 ## Development
 

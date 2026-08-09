@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
+import { createHash } from "node:crypto";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
@@ -80,6 +81,29 @@ describe("parseSseFramesForTest", () => {
 });
 
 describe("execute", () => {
+  it("fails closed before creating a run when assigned skills cannot be synchronized", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ run_id: "unexpected" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      paperclipSkillSync: { desiredSkills: ["marketing"] },
+      paperclipRuntimeSkills: [{
+        key: "marketing",
+        runtimeName: "marketing",
+        source: "/missing/marketing",
+        sourceStatus: "missing",
+      }],
+    }));
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "hermes_gateway_skill_management_unconfigured",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects remote plain HTTP unless the unsafe dev escape hatch is enabled", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ run_id: "unexpected" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
@@ -142,6 +166,85 @@ describe("execute", () => {
     const body = JSON.parse(String(init.body));
     expect(body.input).toContain("Do the thing");
     expect(body.session_id).toBe("paperclip:company:company-1:agent:agent-1:issue:issue-1");
+  });
+
+  it("loads the selected profile AGENTS.md for the next run", async () => {
+    const bridgeHash = `sha256:${createHash("sha256").update("# Remote role\n", "utf8").digest("hex")}`;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/instructions/AGENTS.md") {
+        expect(url.searchParams.get("profile")).toBe("marketing");
+        expect(init?.headers).toMatchObject({ Authorization: "Bearer bridge-secret" });
+        return Response.json({
+          schemaVersion: 1,
+          profile: "marketing",
+          path: "AGENTS.md",
+          size: 14,
+          sha256: bridgeHash,
+          content: "# Remote role\n",
+        });
+      }
+      if (url.pathname === "/api/skills") return Response.json([]);
+      if (url.pathname === "/v1/skill-bundles") {
+        return Response.json({ schemaVersion: 1, skills: [] });
+      }
+      if (url.pathname === "/v1/runs") {
+        return Response.json({ run_id: "run-hermes-remote", status: "started" });
+      }
+      return Response.json({ status: "completed", output: "done" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      profile: "marketing",
+      managementBaseUrl: "https://management.test",
+      managementCredential: "management-secret",
+      skillBridgeBaseUrl: "https://bridge.test",
+      skillBridgeCredential: "bridge-secret",
+      timeoutSec: 5,
+    }));
+
+    expect(result.exitCode).toBe(0);
+    const runCall = fetchMock.mock.calls.find(([input]) => new URL(String(input)).pathname === "/v1/runs");
+    expect(runCall).toBeTruthy();
+    expect(JSON.parse(String(runCall?.[1]?.body))).toMatchObject({ instructions: "# Remote role\n" });
+  });
+
+  it("keeps explicit run instructions ahead of remote AGENTS.md", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/skills") return Response.json([]);
+      if (url.pathname === "/v1/skill-bundles") {
+        return Response.json({ schemaVersion: 1, skills: [] });
+      }
+      if (url.pathname === "/v1/runs") {
+        return Response.json({ run_id: "run-hermes-explicit", status: "started" });
+      }
+      return Response.json({ status: "completed", output: "done" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      profile: "marketing",
+      managementBaseUrl: "https://management.test",
+      managementCredential: "management-secret",
+      skillBridgeBaseUrl: "https://bridge.test",
+      skillBridgeCredential: "bridge-secret",
+      instructions: "Use the explicit override.",
+      timeoutSec: 5,
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(fetchMock.mock.calls.some(([input]) => new URL(String(input)).pathname.startsWith("/v1/instructions")))
+      .toBe(false);
+    const runCall = fetchMock.mock.calls.find(([input]) => new URL(String(input)).pathname === "/v1/runs");
+    expect(JSON.parse(String(runCall?.[1]?.body))).toMatchObject({
+      instructions: "Use the explicit override.",
+    });
   });
 
   it("sends the task brief once on fresh runs and compacts it on stable-session resumes", async () => {

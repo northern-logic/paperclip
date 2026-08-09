@@ -2355,6 +2355,56 @@ function resolveManagedSkillsRoot(companyId: string) {
   return path.resolve(resolvePaperclipInstanceRoot(), "skills", companyId);
 }
 
+function resolveOwnedManagedLocalSkillSourcePath(
+  companyId: string,
+  skill: Pick<CompanySkill, "sourceType" | "sourceLocator" | "slug" | "metadata">,
+) {
+  if (skill.sourceType !== "local_path" || getSkillMeta(skill).sourceKind !== "managed_local") {
+    return null;
+  }
+
+  const managedRoot = resolveManagedSkillsRoot(companyId);
+  const sourceDir = normalizeSourceLocatorDirectory(skill.sourceLocator);
+  if (!sourceDir || sourceDir === managedRoot) return null;
+  if (path.dirname(sourceDir) !== managedRoot) return null;
+  if (path.basename(sourceDir) !== skill.slug) return null;
+  return sourceDir;
+}
+
+type StagedSkillPathDeletion = {
+  originalPath: string;
+  tombstonePath: string;
+};
+
+async function stageSkillPathForDeletion(
+  originalPath: string,
+  skillId: string,
+): Promise<StagedSkillPathDeletion | null> {
+  const tombstonePath = path.join(
+    path.dirname(originalPath),
+    `.${path.basename(originalPath)}.deleting-${skillId}-${randomUUID()}`,
+  );
+  try {
+    await fs.rename(originalPath, tombstonePath);
+    return { originalPath, tombstonePath };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function restoreStagedSkillPathDeletions(stagedPaths: StagedSkillPathDeletion[]) {
+  const restoreErrors: unknown[] = [];
+  for (const staged of [...stagedPaths].reverse()) {
+    try {
+      await fs.rename(staged.tombstonePath, staged.originalPath);
+    } catch (error) {
+      restoreErrors.push(error);
+    }
+  }
+  return restoreErrors;
+}
+
 /**
  * A rename target must be a true Paperclip-managed local skill: a `local_path`
  * skill whose `managed_local` source directory lives directly under the
@@ -5720,8 +5770,7 @@ export function companySkillService(db: Db) {
   }
 
   async function materializeVersionSnapshot(companyId: string, skill: CompanySkill, version: CompanySkillVersion) {
-    const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__versions__");
-    const skillDir = path.resolve(runtimeRoot, skill.id, version.id);
+    const skillDir = path.resolve(resolveVersionSkillMaterializedPath(companyId, skill.id), version.id);
     if (await materializedVersionSnapshotMatches(skillDir, version)) {
       return skillDir;
     }
@@ -5749,6 +5798,10 @@ export function companySkillService(db: Db) {
   function resolveRuntimeSkillMaterializedPath(companyId: string, skill: Pick<CompanySkill, "key" | "slug">) {
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
     return path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
+  }
+
+  function resolveVersionSkillMaterializedPath(companyId: string, skillId: string) {
+    return path.resolve(resolveManagedSkillsRoot(companyId), "__versions__", skillId);
   }
 
   async function resolveRuntimeSkillSource(
@@ -6859,13 +6912,49 @@ export function companySkillService(db: Db) {
       );
     }
 
-    // Delete DB row
-    await db
-      .delete(companySkills)
-      .where(eq(companySkills.id, skillId));
+    const ownedSourcePath = resolveOwnedManagedLocalSkillSourcePath(companyId, skill);
+    const runtimePath = resolveRuntimeSkillMaterializedPath(companyId, skill);
+    const stagedPaths: StagedSkillPathDeletion[] = [];
 
-    // Clean up materialized runtime files
-    await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, skill), { recursive: true, force: true });
+    try {
+      if (ownedSourcePath) {
+        const stagedSource = await stageSkillPathForDeletion(ownedSourcePath, skill.id);
+        if (stagedSource) stagedPaths.push(stagedSource);
+      }
+      const stagedRuntime = await stageSkillPathForDeletion(runtimePath, skill.id);
+      if (stagedRuntime) stagedPaths.push(stagedRuntime);
+    } catch (error) {
+      const restoreErrors = await restoreStagedSkillPathDeletions(stagedPaths);
+      if (restoreErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...restoreErrors],
+          `Failed to stage deletion for skill "${skill.name}" and restore its managed paths.`,
+        );
+      }
+      throw error;
+    }
+
+    try {
+      // Keep the database identity reserved until owned source and runtime
+      // paths have moved out of their reusable slug locations.
+      await db
+        .delete(companySkills)
+        .where(eq(companySkills.id, skillId));
+    } catch (error) {
+      const restoreErrors = await restoreStagedSkillPathDeletions(stagedPaths);
+      if (restoreErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...restoreErrors],
+          `Failed to delete skill "${skill.name}" and restore its managed paths.`,
+        );
+      }
+      throw error;
+    }
+
+    await Promise.all([
+      ...stagedPaths.map((staged) => fs.rm(staged.tombstonePath, { recursive: true, force: true })),
+      fs.rm(resolveVersionSkillMaterializedPath(companyId, skill.id), { recursive: true, force: true }),
+    ]);
 
     return skill;
   }
