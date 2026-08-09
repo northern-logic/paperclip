@@ -188,6 +188,13 @@ function isMarkdown(pathValue: string) {
   return pathValue.toLowerCase().endsWith(".md");
 }
 
+const REMOTE_HERMES_INSTRUCTION_FILES = [
+  "AGENTS.md",
+  "HEARTBEAT.md",
+  "SOUL.md",
+  "TOOLS.md",
+] as const;
+
 function shouldUseMarkdownInstructionsEditor(input: {
   selectedFileExists: boolean;
   selectedPath: string;
@@ -2086,15 +2093,16 @@ export function PromptsTab({
   }, [agent.id]);
 
   const getCapabilities = useAdapterCapabilities();
-  const isLocal = getCapabilities(agent.adapterType).supportsInstructionsBundle;
+  const supportsInstructions = getCapabilities(agent.adapterType).supportsInstructionsBundle;
 
   const { data: bundle, isLoading: bundleLoading } = useQuery({
     queryKey: queryKeys.agents.instructionsBundle(agent.id),
     queryFn: () => agentsApi.instructionsBundle(agent.id, companyId),
-    enabled: Boolean(companyId && isLocal),
+    enabled: Boolean(companyId && supportsInstructions),
   });
 
-  const persistedMode = bundle?.mode ?? "managed";
+  const isRemoteBundle = bundle?.mode === "remote";
+  const persistedMode: "managed" | "external" = bundle?.mode === "external" ? "external" : "managed";
   const persistedRootPath = persistedMode === "managed"
     ? (bundle?.managedRootPath ?? bundle?.rootPath ?? "")
     : (bundle?.rootPath ?? "");
@@ -2112,10 +2120,12 @@ export function PromptsTab({
     currentRootPath === persistedRootPath,
   );
   const visibleFilePaths = useMemo(
-    () => bundleMatchesDraft
-      ? [...new Set([currentEntryFile, ...fileOptions, ...pendingFiles])]
-      : [currentEntryFile, ...pendingFiles],
-    [bundleMatchesDraft, currentEntryFile, fileOptions, pendingFiles],
+    () => isRemoteBundle
+      ? [...REMOTE_HERMES_INSTRUCTION_FILES]
+      : bundleMatchesDraft
+        ? [...new Set([currentEntryFile, ...fileOptions, ...pendingFiles])]
+        : [currentEntryFile, ...pendingFiles],
+    [bundleMatchesDraft, currentEntryFile, fileOptions, isRemoteBundle, pendingFiles],
   );
   const fileTree = useMemo(
     () => buildFileTree(Object.fromEntries(visibleFilePaths.map((filePath) => [filePath, ""]))),
@@ -2128,7 +2138,7 @@ export function PromptsTab({
   const { data: selectedFileDetail, isLoading: fileLoading } = useQuery({
     queryKey: queryKeys.agents.instructionsFile(agent.id, selectedOrEntryFile),
     queryFn: () => agentsApi.instructionsFile(agent.id, selectedOrEntryFile, companyId),
-    enabled: Boolean(companyId && isLocal && selectedFileExists),
+    enabled: Boolean(companyId && supportsInstructions && selectedFileExists),
   });
 
   const updateBundle = useMutation({
@@ -2191,10 +2201,18 @@ export function PromptsTab({
       if (selectedFile !== bundle.entryFile) setSelectedFile(bundle.entryFile);
       return;
     }
-    if (!availablePaths.includes(selectedFile) && selectedFile !== currentEntryFile && !pendingFiles.includes(selectedFile)) {
+    const isRemoteAllowlistedSelection = isRemoteBundle && REMOTE_HERMES_INSTRUCTION_FILES.some(
+      (path) => path === selectedFile,
+    );
+    if (
+      !availablePaths.includes(selectedFile)
+      && selectedFile !== currentEntryFile
+      && !pendingFiles.includes(selectedFile)
+      && !isRemoteAllowlistedSelection
+    ) {
       setSelectedFile(availablePaths.includes(bundle.entryFile) ? bundle.entryFile : availablePaths[0]!);
     }
-  }, [bundle, bundleMatchesDraft, currentEntryFile, pendingFiles, selectedFile]);
+  }, [bundle, bundleMatchesDraft, currentEntryFile, isRemoteBundle, pendingFiles, selectedFile]);
 
   useEffect(() => {
     const nextExpanded = new Set<string>();
@@ -2362,11 +2380,11 @@ export function PromptsTab({
   const instructionsSideBySide =
     !isMobile && instructionPaneWidth !== null && instructionPaneWidth >= filePanelWidth + 520;
 
-  if (!isLocal) {
+  if (!supportsInstructions) {
     return (
       <div className="max-w-3xl">
         <p className="text-sm text-muted-foreground">
-          Instructions bundles are only available for local adapters.
+          This adapter does not support instruction files.
         </p>
       </div>
     );
@@ -2388,10 +2406,12 @@ export function PromptsTab({
         </div>
       )}
       <p className="text-xs text-muted-foreground">
-        Saved instructions affect the next run. Active runs keep the instructions they started with, and instruction changes may start a fresh adapter session.
+        {isRemoteBundle
+          ? "These files are stored in the selected remote Hermes profile. Saved changes affect the next run; active runs keep the instructions they started with."
+          : "Saved instructions affect the next run. Active runs keep the instructions they started with, and instruction changes may start a fresh adapter session."}
       </p>
 
-      <Collapsible defaultOpen={currentMode === "external"}>
+      {!isRemoteBundle && <Collapsible defaultOpen={currentMode === "external"}>
         <CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors group">
           <ChevronRight className="h-3 w-3 transition-transform group-data-[state=open]:rotate-90" />
           Advanced
@@ -2542,7 +2562,7 @@ export function PromptsTab({
             </div>
           </TooltipProvider>
         </CollapsibleContent>
-      </Collapsible>
+      </Collapsible>}
 
       <div
         ref={containerRef}
@@ -2561,7 +2581,7 @@ export function PromptsTab({
           <div className="flex items-center justify-between">
             <h4 className="text-sm font-medium">Files</h4>
             <div className="flex items-center gap-1">
-              {!showNewFileInput && (
+              {!isRemoteBundle && !showNewFileInput && (
                 <Button
                   type="button"
                   size="icon"
@@ -2655,7 +2675,13 @@ export function PromptsTab({
             wrapLabels
             renderFileExtra={(node) => {
               const file = bundle?.files.find((entry) => entry.path === node.path);
-              if (!file) return null;
+              if (!file) {
+                return isRemoteBundle ? (
+                  <span className="ml-3 shrink-0 rounded border border-border text-muted-foreground px-1.5 py-0.5 text-(length:--text-nano) uppercase tracking-wide">
+                    not created
+                  </span>
+                ) : null;
+              }
               if (file.deprecated) {
                 return (
                   <Tooltip>

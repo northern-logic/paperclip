@@ -33,7 +33,7 @@ export interface AgentRuntimeConfig extends Record<string, unknown> {
   modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
 }
 
-export type AgentInstructionsBundleMode = "managed" | "external";
+export type AgentInstructionsBundleMode = "managed" | "external" | "remote";
 
 export interface AgentInstructionsFileSummary {
   path: string;

@@ -26,6 +26,10 @@ import {
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
 import { ensureGatewaySkillsReady, HermesGatewaySkillError } from "./skills.js";
+import {
+  HermesGatewayInstructionsError,
+  loadGatewayEntryInstructions,
+} from "./instructions.js";
 
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
@@ -320,13 +324,18 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   return lines.filter((line) => line !== null && line !== undefined).join("\n").trim();
 }
 
-function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): Record<string, unknown> {
+function buildRunBody(
+  ctx: AdapterExecutionContext,
+  sessionKey: string | null,
+  remoteInstructions: string | null = null,
+): Record<string, unknown> {
   const paperclipApiUrl = nonEmpty(ctx.config.paperclipApiUrl);
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
   const input = nonEmpty(payloadTemplate.input) ?? buildInput(ctx, paperclipApiUrl);
   const instructions =
     nonEmpty(ctx.config.instructions) ??
     nonEmpty(payloadTemplate.instructions) ??
+    remoteInstructions ??
     "Follow the Paperclip wake instructions exactly. Do not expose secrets in logs, comments, or final output.";
   return {
     ...payloadTemplate,
@@ -840,6 +849,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
+  let remoteInstructions: string | null = null;
+  const payloadTemplate = parseObject(ctx.config.payloadTemplate);
+  const shouldLoadRemoteInstructions =
+    !nonEmpty(ctx.config.instructions)
+    && !nonEmpty(payloadTemplate.instructions)
+    && Boolean(nonEmpty(ctx.config.skillBridgeBaseUrl))
+    && Boolean(nonEmpty(ctx.config.skillBridgeCredential));
+  if (shouldLoadRemoteInstructions) {
+    try {
+      remoteInstructions = await loadGatewayEntryInstructions(ctx.config);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.onLog("stderr", `[hermes-gateway] instruction preflight failed: ${message}\n`);
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: error instanceof HermesGatewayInstructionsError
+          ? error.code
+          : "hermes_gateway_instruction_load_failed",
+        errorMessage: message,
+      };
+    }
+  }
+
   const timeoutSec = parseNonNegativeNumber(ctx.config.timeoutSec, DEFAULT_TIMEOUT_SEC);
   const timeoutMs = timeoutSec > 0 ? Math.ceil(timeoutSec * 1000) : 0;
   const reconnectMs = Math.floor(clamp(parseNonNegativeNumber(ctx.config.eventReconnectMs, DEFAULT_EVENT_RECONNECT_MS), 250, 30_000));
@@ -874,7 +908,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runHeaders.Authorization,
     runHeaders["X-Hermes-Session-Key"],
   ]);
-  const body = buildRunBody(ctx, sessionKey);
+  const body = buildRunBody(ctx, sessionKey, remoteInstructions);
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
 
   await ctx.onMeta?.({

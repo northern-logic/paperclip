@@ -11,6 +11,7 @@ import {
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
 import { testGatewaySkillServices } from "./skills.js";
+import { testGatewayInstructionsService } from "./instructions.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -123,6 +124,7 @@ export async function testEnvironment(
   }
 
   checks.push(...await testGatewaySkillServices(ctx.config));
+  checks.push(...await testGatewayInstructionsService(ctx.config));
 
   if (checks.some((check) => check.level === "error") || !parsed || !apiKey) {
     return {

@@ -1,8 +1,8 @@
-# Hermes Gateway Skills
+# Hermes Gateway Profile Management
 
-This document defines Northern Logic's version 1 skill-management contract for
-the built-in `hermes_gateway` adapter. It extends the gateway adapter without
-changing or forking Hermes.
+This document defines Northern Logic's version 1 skill and instruction-file
+management contract for the built-in `hermes_gateway` adapter. It extends the
+gateway adapter without changing or forking Hermes.
 
 ## Authority and ownership
 
@@ -41,6 +41,36 @@ For unattended loopback management, start the stock dashboard with a stable
 
 - `GET /api/skills?profile=<profile>`
 - `PUT /api/skills/toggle` with `{ "name", "enabled", "profile" }`
+
+## Profile instruction files
+
+The authenticated bridge also exposes a fixed instruction-file surface for the
+selected Hermes profile:
+
+- `AGENTS.md` — Paperclip's entry instruction file and the stable instructions
+  loaded for the next gateway run when no explicit inline override is set.
+- `HEARTBEAT.md` — optional heartbeat guidance.
+- `SOUL.md` — Hermes' native profile identity file.
+- `TOOLS.md` — optional tool-use guidance.
+
+Hermes gives every named profile its own home directory, but it does not create
+all four files for every profile. Paperclip therefore displays the complete
+allowlist and lets an operator create missing optional files. The bridge never
+accepts arbitrary filenames or paths, never follows symlinks, and never allows
+`AGENTS.md` to be deleted.
+
+```http
+GET /v1/instructions?profile=default
+GET /v1/instructions/AGENTS.md?profile=default
+PUT /v1/instructions/AGENTS.md?profile=default
+DELETE /v1/instructions/TOOLS.md?profile=default
+Authorization: Bearer <bridge credential>
+```
+
+Writes use `{ "schemaVersion": 1, "profile": "default", "content": "..." }`
+and are committed atomically. Paperclip resolves the bridge credential only on
+the server, so instruction content and credentials are not routed through the
+browser as adapter configuration.
 
 ## Bundle bridge contract v1
 

@@ -70,6 +70,7 @@ import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/executio
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestResult,
+  AdapterInstructionsBundleSnapshot,
   AdapterModelProfileDefinition,
 } from "@paperclipai/adapter-utils";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
@@ -169,6 +170,7 @@ export function agentRoutes(
   function resolveInstructionsPathKey(adapterType: string): string | null {
     const adapter = findActiveServerAdapter(adapterType);
     if (adapter?.instructionsPathKey) return adapter.instructionsPathKey;
+    if (adapter?.getInstructionsBundle) return null;
     if (adapter?.supportsInstructionsBundle === true) return "instructionsFilePath";
     if (adapter?.supportsInstructionsBundle === false) return null;
     return DEFAULT_INSTRUCTIONS_PATH_KEYS[adapterType] ?? null;
@@ -204,6 +206,75 @@ export function agentRoutes(
   const workspaceOperations = workspaceOperationService(db);
   const instanceSettings = instanceSettingsService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  type InstructionsAgent = {
+    id: string;
+    companyId: string;
+    adapterType: string;
+    adapterConfig: unknown;
+  };
+
+  function remoteInstructionsAdapter(agent: InstructionsAgent) {
+    const adapter = findActiveServerAdapter(agent.adapterType);
+    if (!adapter?.getInstructionsBundle) return null;
+    if (!adapter.readInstructionsFile || !adapter.writeInstructionsFile || !adapter.deleteInstructionsFile) {
+      throw new HttpError(500, `Adapter '${agent.adapterType}' has an incomplete instructions contract`);
+    }
+    return adapter;
+  }
+
+  async function remoteInstructionsContext(req: Request, agent: InstructionsAgent) {
+    const { config } = await secretsSvc.resolveAdapterConfigForRuntime(
+      agent.companyId,
+      asRecord(agent.adapterConfig) ?? {},
+      buildActorSecretContext(req, { consumerType: "agent", consumerId: agent.id }),
+      { adapterType: agent.adapterType, skipUserSecrets: true },
+    );
+    return {
+      agentId: agent.id,
+      companyId: agent.companyId,
+      adapterType: agent.adapterType,
+      config,
+    };
+  }
+
+  function toRemoteInstructionsBundle(
+    agent: InstructionsAgent,
+    snapshot: AdapterInstructionsBundleSnapshot,
+  ) {
+    return {
+      agentId: agent.id,
+      companyId: agent.companyId,
+      mode: "remote" as const,
+      rootPath: null,
+      managedRootPath: "",
+      entryFile: snapshot.entryFile,
+      resolvedEntryPath: null,
+      editable: snapshot.editable,
+      warnings: snapshot.warnings,
+      legacyPromptTemplateActive: false,
+      legacyBootstrapPromptTemplateActive: false,
+      files: snapshot.files,
+    };
+  }
+
+  async function withRemoteInstructionsError<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      const candidate = error as { status?: unknown; code?: unknown; message?: unknown };
+      const upstreamStatus = typeof candidate.status === "number" ? candidate.status : null;
+      const status = upstreamStatus && [400, 404, 409, 413, 422].includes(upstreamStatus)
+        ? upstreamStatus
+        : 502;
+      const message = typeof candidate.message === "string" && candidate.message.trim()
+        ? candidate.message
+        : "Remote instructions operation failed";
+      throw new HttpError(status, message, {
+        code: typeof candidate.code === "string" ? candidate.code : "remote_instructions_failed",
+      });
+    }
+  }
 
   async function assertAgentEnvironmentSelection(
     companyId: string,
@@ -2907,6 +2978,13 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
     await assertCanReadAgent(req, existing);
+    const adapter = remoteInstructionsAdapter(existing);
+    if (adapter) {
+      const context = await remoteInstructionsContext(req, existing);
+      const snapshot = await withRemoteInstructionsError(() => adapter.getInstructionsBundle!(context));
+      res.json(toRemoteInstructionsBundle(existing, snapshot));
+      return;
+    }
     res.json(await instructions.getBundle(existing));
   });
 
@@ -2915,6 +2993,10 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
     await assertCanManageInstructionsPath(req, existing);
+
+    if (remoteInstructionsAdapter(existing)) {
+      throw unprocessable("Remote adapter instruction storage and entry file are fixed by the adapter.");
+    }
 
     const actor = getActorInfo(req);
     const { bundle, adapterConfig } = await instructions.updateBundle(existing, req.body);
@@ -2968,6 +3050,13 @@ export function agentRoutes(
       return;
     }
 
+    const adapter = remoteInstructionsAdapter(existing);
+    if (adapter) {
+      const context = await remoteInstructionsContext(req, existing);
+      res.json(await withRemoteInstructionsError(() => adapter.readInstructionsFile!(context, relativePath)));
+      return;
+    }
+
     res.json(await instructions.readFile(existing, relativePath));
   });
 
@@ -2978,6 +3067,29 @@ export function agentRoutes(
     await assertCanManageInstructionsPath(req, existing);
 
     const actor = getActorInfo(req);
+    const adapter = remoteInstructionsAdapter(existing);
+    if (adapter) {
+      const context = await remoteInstructionsContext(req, existing);
+      const file = await withRemoteInstructionsError(() => adapter.writeInstructionsFile!(
+        context,
+        req.body.path,
+        req.body.content,
+      ));
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "agent.instructions_file_updated",
+        entityType: "agent",
+        entityId: existing.id,
+        details: { path: file.path, size: file.size, mode: "remote" },
+      });
+      res.json(file);
+      return;
+    }
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
       clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
     });
@@ -3031,6 +3143,25 @@ export function agentRoutes(
     }
 
     const actor = getActorInfo(req);
+    const adapter = remoteInstructionsAdapter(existing);
+    if (adapter) {
+      const context = await remoteInstructionsContext(req, existing);
+      const snapshot = await withRemoteInstructionsError(() => adapter.deleteInstructionsFile!(context, relativePath));
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "agent.instructions_file_deleted",
+        entityType: "agent",
+        entityId: existing.id,
+        details: { path: relativePath, mode: "remote" },
+      });
+      res.json(toRemoteInstructionsBundle(existing, snapshot));
+      return;
+    }
     const result = await instructions.deleteFile(existing, relativePath);
     await logActivity(db, {
       companyId: existing.companyId,

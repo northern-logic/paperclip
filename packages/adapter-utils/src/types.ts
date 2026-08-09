@@ -282,6 +282,36 @@ export interface AdapterSkillContext {
   config: Record<string, unknown>;
 }
 
+export interface AdapterInstructionsFileSummary {
+  path: string;
+  size: number;
+  language: string;
+  markdown: boolean;
+  isEntryFile: boolean;
+  editable: boolean;
+  deprecated: boolean;
+  virtual: boolean;
+}
+
+export interface AdapterInstructionsFileDetail extends AdapterInstructionsFileSummary {
+  content: string;
+}
+
+export interface AdapterInstructionsBundleSnapshot {
+  mode: "remote";
+  entryFile: string;
+  editable: boolean;
+  warnings: string[];
+  files: AdapterInstructionsFileSummary[];
+}
+
+export interface AdapterInstructionsContext {
+  agentId: string;
+  companyId: string;
+  adapterType: string;
+  config: Record<string, unknown>;
+}
+
 export interface AdapterEnvironmentTestContext {
   companyId: string;
   adapterType: string;
@@ -423,6 +453,14 @@ export interface ServerAdapterModule {
   acp?: AcpTargetDescriptor;
   listSkills?: (ctx: AdapterSkillContext) => Promise<AdapterSkillSnapshot>;
   syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[]) => Promise<AdapterSkillSnapshot>;
+  getInstructionsBundle?: (ctx: AdapterInstructionsContext) => Promise<AdapterInstructionsBundleSnapshot>;
+  readInstructionsFile?: (ctx: AdapterInstructionsContext, path: string) => Promise<AdapterInstructionsFileDetail>;
+  writeInstructionsFile?: (
+    ctx: AdapterInstructionsContext,
+    path: string,
+    content: string,
+  ) => Promise<AdapterInstructionsFileDetail>;
+  deleteInstructionsFile?: (ctx: AdapterInstructionsContext, path: string) => Promise<AdapterInstructionsBundleSnapshot>;
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   supportsLocalAgentJwt?: boolean;

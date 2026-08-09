@@ -321,6 +321,91 @@ describe("PromptsTab instruction editor", () => {
     });
   });
 
+  it("edits remote Hermes profile files without showing local path controls", async () => {
+    const summary = makeSummary("AGENTS.md", "AGENTS.md");
+    await renderPromptsTab(
+      makeBundle("AGENTS.md", [summary], {
+        mode: "remote",
+        rootPath: null,
+        managedRootPath: "",
+        resolvedEntryPath: null,
+      }),
+      { "AGENTS.md": makeDetail(summary, "# Remote role") },
+      { agent: makeAgent({ adapterType: "hermes_gateway" }) },
+    );
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("selected remote Hermes profile");
+      expect(container.querySelector<HTMLTextAreaElement>('[data-testid="markdown-editor"]')?.value).toBe("# Remote role");
+    });
+    expect(container.textContent).not.toContain("Advanced");
+    expect(container.textContent).not.toContain("Root path");
+    expect(container.textContent).toContain("HEARTBEAT.md");
+    expect(container.textContent).toContain("SOUL.md");
+    expect(container.textContent).toContain("TOOLS.md");
+    expect(container.textContent).toContain("not created");
+
+    const editor = container.querySelector<HTMLTextAreaElement>('[data-testid="markdown-editor"]')!;
+    await act(async () => {
+      setNativeValue(editor, "# Updated remote role");
+    });
+    await waitFor(() => expect(saveAction).toEqual(expect.any(Function)));
+    saveAction?.();
+    await waitFor(() => {
+      expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledWith(
+        "agent-1",
+        {
+          path: "AGENTS.md",
+          content: "# Updated remote role",
+          clearLegacyPromptTemplate: false,
+        },
+        "company-1",
+      );
+    });
+    expect(mockAgentsApi.updateInstructionsBundle).not.toHaveBeenCalled();
+  });
+
+  it("creates a missing allowlisted Hermes profile file directly from the file list", async () => {
+    const summary = makeSummary("AGENTS.md", "AGENTS.md");
+    await renderPromptsTab(
+      makeBundle("AGENTS.md", [summary], {
+        mode: "remote",
+        rootPath: null,
+        managedRootPath: "",
+        resolvedEntryPath: null,
+      }),
+      { "AGENTS.md": makeDetail(summary, "# Remote role") },
+      { agent: makeAgent({ adapterType: "hermes_gateway" }) },
+    );
+
+    const soulRow = await waitFor(() => {
+      const candidate = container.querySelector<HTMLDivElement>('[data-file-tree-path="SOUL.md"]');
+      if (!candidate) throw new Error("SOUL.md file row not found");
+      return candidate;
+    });
+    await act(() => soulRow.click());
+    const editor = await waitFor(() => {
+      const candidate = container.querySelector<HTMLTextAreaElement>('[data-testid="markdown-editor"]');
+      if (!candidate || candidate.value !== "") throw new Error("Missing SOUL.md editor not ready");
+      return candidate;
+    });
+
+    await act(() => setNativeValue(editor, "# Profile soul"));
+    await waitFor(() => expect(saveAction).toEqual(expect.any(Function)));
+    saveAction?.();
+    await waitFor(() => {
+      expect(mockAgentsApi.saveInstructionsFile).toHaveBeenCalledWith(
+        "agent-1",
+        {
+          path: "SOUL.md",
+          content: "# Profile soul",
+          clearLegacyPromptTemplate: false,
+        },
+        "company-1",
+      );
+    });
+  });
+
   it("uses the Markdown editor for pending new .md files before server metadata exists", async () => {
     const summary = makeSummary("settings.json", "settings.json", {
       language: "json",
