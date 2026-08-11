@@ -171,6 +171,9 @@ async function runExecutor(
   const logs: Array<{ stream: string; text: string }> = [];
   const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
   const execute = createAcpxEngineExecutor({
+    warmHandles: new Map(),
+    stagedRuntimes: new Map(),
+    stagingLocks: new Map(),
     ...(options.prepareRemoteManagedHome
       ? { prepareRemoteManagedHome: options.prepareRemoteManagedHome }
       : {}),

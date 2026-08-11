@@ -10,13 +10,22 @@ import { AuthPage } from "./Auth";
 
 const getSessionMock = vi.hoisted(() => vi.fn());
 const signInEmailMock = vi.hoisted(() => vi.fn());
+const signInPortalMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
+const getHealthMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/auth", () => ({
   authApi: {
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
+    signInPortal: (input: unknown) => signInPortalMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
+  },
+}));
+
+vi.mock("../api/health", () => ({
+  healthApi: {
+    get: () => getHealthMock(),
   },
 }));
 
@@ -86,7 +95,12 @@ describe("AuthPage", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     getSessionMock.mockResolvedValue(null);
+    getHealthMock.mockResolvedValue({
+      status: "ok",
+      deploymentMode: "authenticated",
+    });
     signInEmailMock.mockResolvedValue(undefined);
+    signInPortalMock.mockImplementation(() => new Promise(() => undefined));
     signUpEmailMock.mockResolvedValue(undefined);
   });
 
@@ -113,6 +127,60 @@ describe("AuthPage", () => {
     await flushReact();
     return { root, queryClient };
   }
+
+  async function mountAt(path: string) {
+    const { root, queryClient } = renderAuthPage(container);
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={[path]}>
+          <QueryClientProvider client={queryClient}>
+            <Routes>
+              <Route path="/auth" element={<AuthPage />} />
+            </Routes>
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+    return { root, queryClient };
+  }
+
+  it("starts Northern Logic portal SSO automatically and preserves the local return path", async () => {
+    getHealthMock.mockResolvedValueOnce({
+      status: "ok",
+      deploymentMode: "authenticated",
+      authentication: { portalSsoEnabled: true },
+    });
+
+    const { root } = await mountAt("/auth?next=%2FNOR%2Fissues");
+
+    expect(signInPortalMock).toHaveBeenCalledWith({ callbackURL: "/NOR/issues" });
+    expect(container.textContent).toContain("Redirecting to the Northern Logic portal");
+    expect(container.querySelector('input[name="email"]')).toBeNull();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("keeps a local recovery sign-in available without starting SSO", async () => {
+    getHealthMock.mockResolvedValueOnce({
+      status: "ok",
+      deploymentMode: "authenticated",
+      authentication: { portalSsoEnabled: true },
+    });
+
+    const { root } = await mountAt("/auth?local=1&next=%2FNOR%2Fdashboard");
+
+    expect(signInPortalMock).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Local Paperclip sign in");
+    expect(container.querySelector('input[name="email"]')).not.toBeNull();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
 
   it("exposes password-manager metadata and a11y attributes on the sign-in form", async () => {
     const { root } = await mount();
@@ -247,7 +315,7 @@ describe("AuthPage", () => {
       email: "jane@example.com",
       password: "supersecret",
     });
-    expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
+    expect(getHealthMock.mock.calls.length).toBeGreaterThanOrEqual(2);
 
     await act(async () => {
       root.unmount();
