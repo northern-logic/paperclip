@@ -20,6 +20,10 @@ export interface SignOutResult {
   redirectTo?: string;
 }
 
+export interface PortalSignInResult {
+  url: string;
+}
+
 export class AuthApiError extends Error {
   status: number;
   code: string | null;
@@ -164,6 +168,18 @@ export const authApi = {
 
   signInEmail: async (input: { email: string; password: string }) => {
     await authPost("/sign-in/email", input);
+  },
+
+  signInPortal: async (input: { callbackURL: string }): Promise<PortalSignInResult> => {
+    const payload = await authPost("/sign-in/oauth2", {
+      providerId: "northern-logic-portal",
+      callbackURL: input.callbackURL,
+      errorCallbackURL: "/auth?local=1&error=portal_sso",
+    });
+    if (!payload || typeof payload !== "object" || typeof (payload as { url?: unknown }).url !== "string") {
+      throw new Error("Northern Logic portal sign-in did not return a redirect URL.");
+    }
+    return { url: (payload as { url: string }).url };
   },
 
   signUpEmail: async (input: { name: string; email: string; password: string }) => {

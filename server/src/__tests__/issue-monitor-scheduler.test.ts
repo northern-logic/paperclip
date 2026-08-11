@@ -329,13 +329,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       agentId: participantAgentId,
       reason: "execution_review_participant_recovery",
     });
-    await waitForHeartbeatIdle();
+    await waitForHeartbeatSideEffectsSettled();
     const participantRuns = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, participantAgentId));
-    expect(participantRuns).toHaveLength(1);
-    expect(participantRuns[0]?.errorCode).not.toBe("issue_assignee_changed");
+    // The participant may complete quickly enough for the bounded review
+    // recovery path to enqueue its single retry before this assertion.
+    expect(participantRuns.length).toBeGreaterThanOrEqual(1);
+    expect(participantRuns.length).toBeLessThanOrEqual(2);
+    expect(participantRuns.every((run) => run.errorCode !== "issue_assignee_changed")).toBe(true);
   });
 
   it("lets the board trigger a scheduled issue monitor immediately", async () => {

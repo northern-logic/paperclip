@@ -312,13 +312,12 @@ async function adoptLocalServiceFromPortOwner(input: {
 
   if (input.cwd) {
     const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
-    if (!ownerCwd || !(await isLocalServiceProcessInWorkspace(ownerCwd, input.cwd))) {
+    if (!(await isLocalServiceRegistryCwdCompatible(ownerCwd, input.cwd))) {
       return null;
     }
   }
 
   const processGroupId = await readProcessGroupId(ownerPid);
-  const pid = processGroupId && isPidAlive(processGroupId) ? processGroupId : ownerPid;
   const now = new Date().toISOString();
   const record: LocalServiceRegistryRecord = {
     version: 1,
@@ -330,8 +329,8 @@ async function adoptLocalServiceFromPortOwner(input: {
     envFingerprint: input.envFingerprint ?? "",
     port: input.port,
     url: input.url ?? null,
-    pid,
-    processGroupId: processGroupId ?? pid,
+    pid: ownerPid,
+    processGroupId: processGroupId ?? ownerPid,
     provider: "local_process",
     runtimeServiceId: null,
     reuseKey: input.envFingerprint ?? null,

@@ -20,6 +20,7 @@ import {
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
+import { hasPortalSsoConfiguration } from "../auth/portal-sso.js";
 
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,
@@ -134,6 +135,7 @@ export function healthRoutes(
     );
     const runtimeEnv = opts.runtimeEnv ?? process.env;
     const cloud = getCloudHealthStatus(runtimeEnv);
+    const portalSsoEnabled = hasPortalSsoConfiguration(runtimeEnv);
     // serverInfo (git SHA + process start) rides on the full-details responses
     // only, so it reaches board/agent actors in authenticated mode or any caller
     // in local_trusted dev — never anonymous authenticated callers. The
@@ -163,6 +165,7 @@ export function healthRoutes(
               status: "ok",
               deploymentMode: opts.deploymentMode,
               commit,
+              ...(portalSsoEnabled ? { authentication: { portalSsoEnabled: true } } : {}),
               ...(cloud ? { cloud } : {}),
             },
       );
@@ -251,6 +254,7 @@ export function healthRoutes(
         commit,
         bootstrapStatus,
         bootstrapInviteActive,
+        ...(portalSsoEnabled ? { authentication: { portalSsoEnabled: true } } : {}),
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
@@ -269,6 +273,7 @@ export function healthRoutes(
       authReady: opts.authReady,
       bootstrapStatus,
       bootstrapInviteActive,
+      ...(portalSsoEnabled ? { authentication: { portalSsoEnabled: true } } : {}),
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },

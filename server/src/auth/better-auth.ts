@@ -3,6 +3,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import { betterAuth, type Auth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
+import { genericOAuth } from "better-auth/plugins";
 import type { Db } from "@paperclipai/db";
 import {
   authAccounts,
@@ -12,6 +13,7 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { resolvePortalSsoConfig } from "./portal-sso.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -161,6 +163,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     authPublicBaseUrl: config.authPublicBaseUrl,
     publicUrl,
   });
+  const portalSso = resolvePortalSsoConfig(process.env, publicUrl);
 
   const authConfig = {
     baseURL: baseUrl,
@@ -180,6 +183,39 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
+    account: portalSso
+      ? {
+          accountLinking: {
+            enabled: true,
+            trustedProviders: [portalSso.providerId],
+            allowDifferentEmails: false,
+            // Existing Paperclip password accounts predate email verification.
+            // The portal is invitation-only and supplies a verified email claim,
+            // so it is the ownership proof for this one trusted provider.
+            requireLocalEmailVerified: false,
+          },
+        }
+      : undefined,
+    plugins: portalSso
+      ? [
+          genericOAuth({
+            config: [
+              {
+                providerId: portalSso.providerId,
+                discoveryUrl: portalSso.discoveryUrl,
+                clientId: portalSso.clientId,
+                ...(portalSso.clientSecret ? { clientSecret: portalSso.clientSecret } : {}),
+                redirectURI: portalSso.redirectURI,
+                scopes: ["openid", "profile", "email"],
+                pkce: true,
+                authentication: portalSso.clientSecret ? "basic" : "post",
+                disableImplicitSignUp: false,
+                overrideUserInfo: true,
+              },
+            ],
+          }),
+        ]
+      : [],
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,

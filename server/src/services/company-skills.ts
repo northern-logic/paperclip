@@ -4897,13 +4897,15 @@ export function companySkillService(db: Db) {
     const entries: CompanySkillProjectBrowseResult["entries"] = [];
     for (const entry of visibleDirectoryEntries.slice(0, 250)) {
       const entryPath = normalizedPath === "." ? entry.name : `${normalizedPath}/${entry.name}`;
+      const isSkill = entry.isDirectory()
+        ? (await fs.readdir(path.join(targetPath, entry.name), { withFileTypes: true }).catch(() => []))
+            .some((child) => child.name === "SKILL.md" && child.isFile())
+        : entry.name === "SKILL.md";
       entries.push({
         name: entry.name,
         path: entryPath,
         kind: entry.isDirectory() ? "directory" : "file",
-        isSkill: entry.isDirectory()
-          ? Boolean((await statPath(path.join(targetPath, entry.name, "SKILL.md")))?.isFile())
-          : entry.name === "SKILL.md",
+        isSkill,
       });
     }
     entries.sort((left, right) => {

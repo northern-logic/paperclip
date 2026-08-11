@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
+import { healthApi } from "../api/health";
 import { queryKeys } from "../lib/queryKeys";
 import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
@@ -12,6 +13,10 @@ import { Sparkles } from "lucide-react";
 
 type AuthMode = "sign_in" | "sign_up";
 
+function safeNextPath(value: string | null): string {
+  return value?.startsWith("/") && !value.startsWith("//") ? value : "/";
+}
+
 export function AuthPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -20,24 +25,62 @@ export function AuthPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(() =>
+    searchParams.get("error") === "portal_sso"
+      ? "Northern Logic portal sign-in could not be completed. You can use the local recovery account below."
+      : null,
+  );
   const errorId = "auth-error";
 
   const nextPath = useMemo(
-    () => searchParams.get("next") || getRememberedInvitePath() || "/",
+    () => safeNextPath(searchParams.get("next") || getRememberedInvitePath()),
     [searchParams],
   );
+  const localSignInRequested = searchParams.get("local") === "1";
   const { data: session, isLoading: isSessionLoading } = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
     retry: false,
   });
+  const { data: health, isLoading: isHealthLoading } = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: () => healthApi.get(),
+    retry: false,
+  });
+  const portalSsoEnabled = health?.authentication?.portalSsoEnabled === true;
 
   useEffect(() => {
     if (session) {
       navigate(nextPath, { replace: true });
     }
   }, [session, navigate, nextPath]);
+
+  useEffect(() => {
+    if (session || isSessionLoading || isHealthLoading || !portalSsoEnabled || localSignInRequested) return;
+
+    let cancelled = false;
+    setError(null);
+    void authApi.signInPortal({ callbackURL: nextPath })
+      .then(({ url }) => {
+        if (!cancelled) window.location.assign(url);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "Northern Logic portal sign-in could not be started.");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    isHealthLoading,
+    isSessionLoading,
+    localSignInRequested,
+    nextPath,
+    portalSsoEnabled,
+    session,
+  ]);
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -68,10 +111,22 @@ export function AuthPage() {
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
 
-  if (isSessionLoading) {
+  if (isSessionLoading || isHealthLoading || (portalSsoEnabled && !localSignInRequested && !error)) {
     return (
-      <div className="fixed inset-0 flex items-center justify-center">
+      <div className="fixed inset-0 flex flex-col gap-4 items-center justify-center">
         <PaperclipLoading className="min-h-0" />
+        {portalSsoEnabled && !localSignInRequested ? (
+          <>
+            <p className="text-sm text-muted-foreground">Redirecting to the Northern Logic portal…</p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => navigate(`/auth?local=1&next=${encodeURIComponent(nextPath)}`, { replace: true })}
+            >
+              Use a local Paperclip account
+            </Button>
+          </>
+        ) : null}
       </div>
     );
   }
@@ -90,16 +145,28 @@ export function AuthPage() {
           </div>
 
           <h1 className="text-xl font-semibold">
-            {mode === "sign_in" ? "Sign in to Paperclip" : "Create your Paperclip account"}
+            {mode === "sign_in" ? "Local Paperclip sign in" : "Create your Paperclip account"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {mode === "sign_in"
-              ? "Use your email and password to access this instance."
+              ? portalSsoEnabled
+                ? "Use the Northern Logic portal for normal access. This local form is retained for account recovery."
+                : "Use your email and password to access this instance."
               : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
 
+          {portalSsoEnabled ? (
+            <Button
+              type="button"
+              className="mt-6 w-full"
+              onClick={() => navigate(`/auth?next=${encodeURIComponent(nextPath)}`, { replace: true })}
+            >
+              Continue with Northern Logic
+            </Button>
+          ) : null}
+
           <form
-            className="mt-6 space-y-4"
+            className={`${portalSsoEnabled ? "mt-4" : "mt-6"} space-y-4`}
             method="post"
             action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
             onSubmit={(event) => {

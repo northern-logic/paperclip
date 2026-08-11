@@ -61,6 +61,12 @@ Paperclip now treats **bind** as a separate concern from auth:
 - explicit public URL required
 - stricter deployment checks and failures in doctor
 - Better Auth request rate limiting is on by default; set `PAPERCLIP_AUTH_RATE_LIMIT_ENABLED=false` only when an explicit front-door limiter covers the deployment
+- A deployment can delegate primary sign-in to the Northern Logic portal by setting
+  `PAPERCLIP_PORTAL_SSO_CLIENT_ID` and `PAPERCLIP_PORTAL_SSO_DISCOVERY_URL` alongside
+  the canonical `PAPERCLIP_PUBLIC_URL`. Paperclip uses the OIDC authorization-code
+  flow with PKCE and keeps `?local=1` as an explicit recovery path. Set
+  `PAPERCLIP_PORTAL_SSO_CLIENT_SECRET` only for a confidential client registration;
+  public PKCE clients leave it unset.
 - recommended bind is `loopback` behind a reverse proxy; direct `lan/custom` is advanced
 - local stdio MCP runtime slots fail closed by default; set `PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST` only when a trusted worker/runtime host is configured to supervise those processes. Remote HTTP MCP remains the preferred public-hosted path.
 

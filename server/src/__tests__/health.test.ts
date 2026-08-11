@@ -387,6 +387,48 @@ describe("GET /health", () => {
     expect(res.body.serverInfo).toBeUndefined();
   });
 
+  it("advertises portal SSO to anonymous authenticated-mode clients without exposing credentials", async () => {
+    const devServerStatus = await import("../dev-server-status.js");
+    vi.spyOn(devServerStatus, "readPersistedDevServerStatus").mockReturnValue(undefined);
+    const { healthRoutes } = await import("../routes/health.js");
+    const db = {
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn().mockResolvedValue([{ count: 1 }]),
+        })),
+      })),
+    } as unknown as Db;
+    const app = express();
+    app.use((req, _res, next) => {
+      (req as any).actor = { type: "none", source: "none" };
+      next();
+    });
+    app.use(
+      "/health",
+      healthRoutes(db, {
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+        authReady: true,
+        companyDeletionEnabled: false,
+        serverInfo: testServerInfo,
+        runtimeEnv: {
+          PAPERCLIP_PORTAL_SSO_CLIENT_ID: "northern-logic-paperclip",
+          PAPERCLIP_PORTAL_SSO_CLIENT_SECRET: "must-not-be-returned",
+          PAPERCLIP_PORTAL_SSO_DISCOVERY_URL:
+            "https://portal.northernlogic.ai/api/auth/.well-known/openid-configuration",
+        } as Parameters<typeof healthRoutes>[1]["runtimeEnv"],
+      }),
+    );
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.authentication).toEqual({ portalSsoEnabled: true });
+    expect(res.text).not.toContain("must-not-be-returned");
+    expect(res.text).not.toContain("openid-configuration");
+  });
+
   it("redacts detailed metadata when authenticated mode is reached without auth middleware", async () => {
     const devServerStatus = await import("../dev-server-status.js");
     vi.spyOn(devServerStatus, "readPersistedDevServerStatus").mockReturnValue(undefined);
